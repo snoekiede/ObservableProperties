@@ -1,0 +1,36 @@
+[package]
+name = "observable-property"
+version = "0.1.0"
+edition = "2021"
+authors = ["Your Name <your.email@example.com>"]
+license = "MIT OR Apache-2.0"
+description = "A thread-safe observable property implementation for Rust"
+repository = "https://github.com/yourusername/observable-property"
+homepage = "https://github.com/yourusername/observable-property"
+documentation = "https://docs.rs/observable-property"
+readme = "README.md"
+keywords = ["observable", "property", "thread-safe", "concurrency", "observer"]
+categories = ["concurrency", "data-structures", "development-tools"]
+exclude = [
+    "target/*",
+    "Cargo.lock",
+    ".git/*",
+    ".github/*",
+]
+
+[lib]
+name = "observable_property"
+path = "src/lib.rs"
+
+[dependencies]
+
+[dev-dependencies]
+# Add any test-only dependencies here if needed
+
+[[example]]
+name = "basic"
+path = "examples/basic.rs"
+
+[[example]]
+name = "multithreaded"
+path = "examples/multithreaded.rs"
