@@ -1,12 +1,12 @@
 [package]
 name = "observable-property"
 version = "0.1.0"
-edition = "2021"
-authors = ["Your Name <your.email@example.com>"]
+edition = "2024"
+authors = ["Iede Snoek <info@esoxsolutions.nl>"]
 license = "MIT OR Apache-2.0"
 description = "A thread-safe observable property implementation for Rust"
-repository = "https://github.com/yourusername/observable-property"
-homepage = "https://github.com/yourusername/observable-property"
+repository = "https://github.com/snoekiede/ObservableProperties"
+homepage = "https://github.com/snoekiede/ObservableProperties"
 documentation = "https://docs.rs/observable-property"
 readme = "README.md"
 keywords = ["observable", "property", "thread-safe", "concurrency", "observer"]
