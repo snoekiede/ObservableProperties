@@ -23,9 +23,16 @@ name = "observable_property"
 path = "src/lib.rs"
 
 [dependencies]
+log = { version = "0.4", optional = true }
+
+[features]
+default = []
+logging = ["log"]
 
 [dev-dependencies]
-# Add any test-only dependencies here if needed
+env_logger = "0.11"
+log = "0.4"
+ # Add any test-only dependencies here if needed
 
 [[example]]
 name = "basic"
@@ -34,3 +41,7 @@ path = "examples/basic.rs"
 [[example]]
 name = "multithreaded"
 path = "examples/multithreaded.rs"
+
+[[example]]
+name = "logging"
+path = "examples/logging.rs"

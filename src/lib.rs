@@ -115,7 +115,8 @@ impl fmt::Display for PropertyError {
 impl std::error::Error for PropertyError {}
 
 /// Function type for observers that get called when property values change
-pub type Observer<T> = Arc<dyn Fn(&T, &T) + Send + Sync>;
+/// HRTB allows calling with any borrow lifetime while the observer itself is 'static.
+pub type Observer<T> = Arc<dyn for<'a> Fn(&'a T, &'a T) + Send + Sync + 'static>;
 
 /// Unique identifier for registered observers
 pub type ObserverId = usize;
@@ -159,7 +160,7 @@ struct InnerProperty<T> {
     next_id: ObserverId,
 }
 
-impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
+impl<T> ObservableProperty<T> {
     /// Creates a new observable property with the given initial value
     ///
     /// # Arguments
@@ -184,6 +185,25 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
         }
     }
 
+    /// Executes a read-only operation under a read lock and returns its result.
+    pub fn with_read<R, F>(&self, f: F) -> Result<R, PropertyError>
+    where
+        F: FnOnce(&T) -> R,
+    {
+        let guard = self.inner.read().map_err(|_| PropertyError::PoisonedLock)?;
+        Ok(f(&guard.value))
+    }
+
+    /// Executes a write operation under a write lock and returns its result.
+    /// No observers are notified by this method.
+    pub fn with_write<R, F>(&self, f: F) -> Result<R, PropertyError>
+    where
+        F: FnOnce(&mut T) -> R,
+    {
+        let mut guard = self.inner.write().map_err(|_| PropertyError::PoisonedLock)?;
+        Ok(f(&mut guard.value))
+    }
+
     /// Gets the current value of the property
     ///
     /// This method acquires a read lock, which allows multiple concurrent readers
@@ -202,7 +222,10 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
     /// let property = ObservableProperty::new("hello".to_string());
     /// assert_eq!(property.get().unwrap(), "hello");
     /// ```
-    pub fn get(&self) -> Result<T, PropertyError> {
+    pub fn get(&self) -> Result<T, PropertyError>
+    where
+        T: Clone,
+    {
         self.inner
             .read()
             .map(|prop| prop.value.clone())
@@ -242,14 +265,15 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
     ///
     /// property.set(20).unwrap(); // Triggers observer notification
     /// ```
-    pub fn set(&self, new_value: T) -> Result<(), PropertyError> {
+    pub fn set(&self, new_value: T) -> Result<(), PropertyError>
+    where
+        T: Clone,
+    {
         let (old_value, observers_snapshot) = {
             let mut prop = self
                 .inner
                 .write()
-                .map_err(|_| PropertyError::WriteLockError {
-                    context: "setting property value".to_string(),
-                })?;
+                .map_err(|_| PropertyError::PoisonedLock)?;
 
             let old_value = prop.value.clone();
             prop.value = new_value.clone();
@@ -257,13 +281,7 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
             (old_value, observers_snapshot)
         };
 
-        for observer in observers_snapshot {
-            if let Err(e) = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-                observer(&old_value, &new_value);
-            })) {
-                eprintln!("Observer panic: {:?}", e);
-            }
-        }
+    notify_observers(&old_value, &new_value, observers_snapshot);
 
         Ok(())
     }
@@ -305,14 +323,15 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
     /// // This returns immediately even though observer is slow
     /// property.set_async(42).unwrap();
     /// ```
-    pub fn set_async(&self, new_value: T) -> Result<(), PropertyError> {
+    pub fn set_async(&self, new_value: T) -> Result<(), PropertyError>
+    where
+        T: Clone + Send + 'static,
+    {
         let (old_value, observers_snapshot) = {
             let mut prop = self
                 .inner
-                .write()
-                .map_err(|_| PropertyError::WriteLockError {
-                    context: "setting property value".to_string(),
-                })?;
+        .write()
+        .map_err(|_| PropertyError::PoisonedLock)?;
 
             let old_value = prop.value.clone();
             prop.value = new_value.clone();
@@ -324,8 +343,9 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
             return Ok(());
         }
 
-        const MAX_THREADS: usize = 4;
-        let observers_per_thread = observers_snapshot.len().div_ceil(MAX_THREADS);
+    const MAX_THREADS: usize = 4;
+    let batches = observers_snapshot.len().min(MAX_THREADS);
+    let observers_per_thread = observers_snapshot.len().div_ceil(batches);
 
         for batch in observers_snapshot.chunks(observers_per_thread) {
             let batch_observers = batch.to_vec();
@@ -333,13 +353,7 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
             let new_val = new_value.clone();
 
             thread::spawn(move || {
-                for observer in batch_observers {
-                    if let Err(e) = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-                        observer(&old_val, &new_val);
-                    })) {
-                        eprintln!("Observer panic in batch thread: {:?}", e);
-                    }
-                }
+                notify_observers(&old_val, &new_val, batch_observers);
             });
         }
 
@@ -379,12 +393,18 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
         let mut prop = self
             .inner
             .write()
-            .map_err(|_| PropertyError::WriteLockError {
-                context: "subscribing observer".to_string(),
-            })?;
+            .map_err(|_| PropertyError::PoisonedLock)?;
 
-        let id = prop.next_id;
-        prop.next_id += 1;
+        // Generate an ID that does not collide even on usize wrap-around
+        let mut id = prop.next_id;
+        loop {
+            prop.next_id = prop.next_id.wrapping_add(1);
+            if !prop.observers.contains_key(&id) {
+                break;
+            }
+            id = prop.next_id;
+        }
+
         prop.observers.insert(id, observer);
         Ok(id)
     }
@@ -420,12 +440,83 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
         let mut prop = self
             .inner
             .write()
-            .map_err(|_| PropertyError::WriteLockError {
-                context: "unsubscribing observer".to_string(),
-            })?;
+            .map_err(|_| PropertyError::PoisonedLock)?;
 
         let was_present = prop.observers.remove(&id).is_some();
         Ok(was_present)
+    }
+
+    /// Updates the value using a closure and notifies observers.
+    /// Returns (old_value, new_value).
+    pub fn update<F>(&self, f: F) -> Result<(T, T), PropertyError>
+    where
+        T: Clone,
+        F: FnOnce(&T) -> T,
+    {
+        let (old_value, new_value, observers_snapshot) = {
+            let mut prop = self
+                .inner
+                .write()
+                .map_err(|_| PropertyError::PoisonedLock)?;
+
+            let old_value = prop.value.clone();
+            let new_value = f(&prop.value);
+            prop.value = new_value.clone();
+            let observers_snapshot: Vec<Observer<T>> = prop.observers.values().cloned().collect();
+            (old_value, new_value, observers_snapshot)
+        };
+
+    notify_observers(&old_value, &new_value, observers_snapshot);
+
+        Ok((old_value, new_value))
+    }
+
+    /// Sets the value only if it differs from the current value.
+    /// Returns true if an update occurred.
+    pub fn set_if_changed(&self, new_value: T) -> Result<bool, PropertyError>
+    where
+        T: PartialEq + Clone,
+    {
+        let (maybe_old, observers_snapshot) = {
+            let mut prop = self
+                .inner
+                .write()
+                .map_err(|_| PropertyError::PoisonedLock)?;
+
+            if prop.value == new_value {
+                return Ok(false);
+            }
+
+            let old_value = prop.value.clone();
+            prop.value = new_value.clone();
+            let observers_snapshot: Vec<Observer<T>> = prop.observers.values().cloned().collect();
+            (Some(old_value), observers_snapshot)
+        };
+
+        if let Some(old_value) = maybe_old {
+            notify_observers(&old_value, &new_value, observers_snapshot);
+        }
+
+        Ok(true)
+    }
+
+    /// Returns the number of registered observers.
+    pub fn observer_count(&self) -> Result<usize, PropertyError> {
+        self.inner
+            .read()
+            .map(|prop| prop.observers.len())
+            .map_err(|_| PropertyError::PoisonedLock)
+    }
+
+    /// Removes all observers. Returns how many were removed.
+    pub fn clear_observers(&self) -> Result<usize, PropertyError> {
+        let mut prop = self
+            .inner
+            .write()
+            .map_err(|_| PropertyError::PoisonedLock)?;
+        let n = prop.observers.len();
+        prop.observers.clear();
+        Ok(n)
     }
 
     /// Subscribes an observer that only gets called when a filter condition is met
@@ -466,7 +557,8 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
         filter: F,
     ) -> Result<ObserverId, PropertyError>
     where
-        F: Fn(&T, &T) -> bool + Send + Sync + 'static,
+    T: 'static,
+    F: Fn(&T, &T) -> bool + Send + Sync + 'static,
     {
         let filter = Arc::new(filter);
         let filtered_observer = Arc::new(move |old_val: &T, new_val: &T| {
@@ -477,9 +569,21 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
 
         self.subscribe(filtered_observer)
     }
+
+    /// Subscribes an observer and immediately invokes it with the current value
+    /// as both old and new, useful to initialize UI state.
+    pub fn subscribe_immediate(&self, observer: Observer<T>) -> Result<ObserverId, PropertyError>
+    where
+        T: Clone,
+    {
+        let current = self.get()?;
+        let id = self.subscribe(observer.clone())?;
+        observer(&current, &current);
+        Ok(id)
+    }
 }
 
-impl<T: Clone> Clone for ObservableProperty<T> {
+impl<T> Clone for ObservableProperty<T> {
     /// Creates a new reference to the same observable property
     ///
     /// This creates a new `ObservableProperty` instance that shares the same
@@ -509,7 +613,33 @@ impl<T: Clone> Clone for ObservableProperty<T> {
     }
 }
 
-impl<T: Clone + std::fmt::Debug + Send + Sync + 'static> std::fmt::Debug for ObservableProperty<T> {
+// --- Internal helpers ---
+
+#[inline]
+fn notify_observers<T>(old_value: &T, new_value: &T, observers: Vec<Observer<T>>) {
+    for observer in observers {
+        if let Err(e) = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+            observer(old_value, new_value);
+        })) {
+            log_error(|| format!("Observer panic: {:?}", e));
+        }
+    }
+}
+
+#[inline]
+fn log_error<F: FnOnce() -> String>(msg: F) {
+    #[cfg(feature = "logging")]
+    {
+        log::error!("{}", msg());
+        return;
+    }
+    #[cfg(not(feature = "logging"))]
+    {
+        let _ = msg; // suppress unused in release without logging
+    }
+}
+
+impl<T: Clone + std::fmt::Debug> std::fmt::Debug for ObservableProperty<T> {
     /// Debug implementation that shows the current value if accessible
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.get() {
@@ -522,6 +652,12 @@ impl<T: Clone + std::fmt::Debug + Send + Sync + 'static> std::fmt::Debug for Obs
                 .field("observers_count", &"[hidden]")
                 .finish(),
         }
+    }
+}
+
+impl<T: Default> Default for ObservableProperty<T> {
+    fn default() -> Self {
+        Self::new(T::default())
     }
 }
 
@@ -711,5 +847,74 @@ mod tests {
         
         // Both observers should have been called
         assert_eq!(slow_observer_count.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn test_set_if_changed_noop() {
+        let prop = ObservableProperty::new(1i32);
+        let count = Arc::new(AtomicUsize::new(0));
+        let c = count.clone();
+        let _ = prop.subscribe(Arc::new(move |_, _| {
+            c.fetch_add(1, Ordering::SeqCst);
+        }));
+        assert!(!prop.set_if_changed(1).unwrap());
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+        assert!(prop.set_if_changed(2).unwrap());
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn test_update_applies_once() {
+        let prop = ObservableProperty::new(10);
+        let seen = Arc::new(AtomicUsize::new(0));
+        let s = seen.clone();
+        let _ = prop.subscribe(Arc::new(move |old, new| {
+            assert_eq!((*old, *new), (10, 15));
+            s.fetch_add(1, Ordering::SeqCst);
+        }));
+        let (old, new) = prop.update(|v| v + 5).unwrap();
+        assert_eq!((old, new), (10, 15));
+        assert_eq!(seen.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn test_clear_observers() {
+        let prop = ObservableProperty::new(0);
+        let count = Arc::new(AtomicUsize::new(0));
+        let c1 = count.clone();
+        let c2 = count.clone();
+        let _ = prop.subscribe(Arc::new(move |_, _| {
+            c1.fetch_add(1, Ordering::SeqCst);
+        }));
+        let _ = prop.subscribe(Arc::new(move |_, _| {
+            c2.fetch_add(1, Ordering::SeqCst);
+        }));
+        let removed = prop.clear_observers().unwrap();
+        assert_eq!(removed, 2);
+        prop.set(1).unwrap();
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn test_subscribe_immediate() {
+        let prop = ObservableProperty::new(String::from("x"));
+        let last = Arc::new(RwLock::new((String::new(), String::new())));
+        let l = last.clone();
+        let _ = prop.subscribe_immediate(Arc::new(move |old, new| {
+            let mut guard = l.write().unwrap();
+            guard.0 = old.clone();
+            guard.1 = new.clone();
+        })).unwrap();
+        {
+            let g = last.read().unwrap();
+            assert_eq!(g.0, "x");
+            assert_eq!(g.1, "x");
+        }
+        prop.set(String::from("y")).unwrap();
+        {
+            let g = last.read().unwrap();
+            assert_eq!(g.0, "x");
+            assert_eq!(g.1, "y");
+        }
     }
 }

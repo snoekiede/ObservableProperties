@@ -14,9 +14,9 @@ A thread-safe observable property implementation for Rust that allows you to obs
 
 * **Panic isolation**: Observer panics don't crash the system
 
-* **Type-safe**: Generic implementation works with any `Clone + Send + Sync + 'static` type
+* **Type-safe**: Generic implementation; most methods only need `Clone`, async paths need `Send + 'static`
 
-* **Zero dependencies**: Uses only Rust standard library
+* **Zero mandatory dependencies**: Standard library only; optional `logging` feature uses the `log` crate
 
 ## Quick Start
 
@@ -25,6 +25,22 @@ Add this to your `Cargo.toml`:
 ```toml
 [dependencies]
 observable-property = "0.1.0"
+```
+
+Optional logging support (feature-flagged):
+
+```toml
+[dependencies]
+observable-property = { version = "0.1.0", features = ["logging"] }
+
+[dependencies.env_logger]
+version = "0.11" # or latest
+```
+
+Then initialize a logger in your binary (tests/examples often use `env_logger`):
+
+```rust
+env_logger::init();
 ```
 
 ## Usage
@@ -90,6 +106,22 @@ counter.set(3).unwrap();  // Does NOT trigger observer
 counter.set(10).unwrap(); // Triggers observer: "Increased: 3 -> 10"
 ```
 
+### Immediate Subscription
+
+Invoke an observer right away with the current value (useful for UI/state init):
+
+```rust
+use observable_property::ObservableProperty;
+use std::sync::Arc;
+
+let prop = ObservableProperty::new(String::from("ready"));
+
+prop.subscribe_immediate(Arc::new(|old, new| {
+    // old == new == "ready" on first call
+    println!("initial: {old} / {new}");
+})).unwrap();
+```
+
 ### Async Notifications
 
 For observers that might perform time-consuming operations, use async notifications to avoid blocking:
@@ -109,6 +141,42 @@ property.subscribe(Arc::new(|old, new| {
 
 // This returns immediately even though observer is slow
 property.set_async(42).unwrap();
+```
+
+### Change Utilities
+
+Update atomically from the current value and notify once:
+
+```rust
+let prop = ObservableProperty::new(10);
+let (old, new) = prop.update(|v| v + 5).unwrap();
+assert_eq!((old, new), (10, 15));
+```
+
+Avoid redundant notifications when the value is unchanged:
+
+```rust
+let updated = prop.set_if_changed(15).unwrap();
+assert!(!updated); // value was already 15
+```
+
+### Lock Helpers
+
+Run closures under locks without cloning the whole value:
+
+```rust
+let len = prop.with_read(|s: &String| s.len()).unwrap();
+
+prop.with_write(|v: &mut String| v.push_str("!"))
+    .unwrap();
+```
+
+### Observer Management
+
+```rust
+let count = prop.observer_count().unwrap();
+let removed = prop.clear_observers().unwrap();
+assert_eq!(removed, count);
 ```
 
 ### Complex Types
@@ -168,6 +236,8 @@ match property.get() {
 
 * **Observer panics** are isolated and won't affect other observers or crash the system
 
+* **Logging** of observer panics is available when enabling the `logging` feature (uses the `log` facade)
+
 ## Examples
 
 Run the included examples to see more usage patterns:
@@ -178,6 +248,9 @@ cargo run --example basic
 
 # Multithreaded usage with performance comparisons
 cargo run --example multithreaded
+
+# Logging example (enable feature)
+cargo run --example logging --features logging
 ```
 
 ## Safety
@@ -191,6 +264,23 @@ This crate is designed with safety as a primary concern:
 * Lock poisoning is properly handled and reported
 
 * No unsafe code is used
+
+## API overview
+
+| Area | Method | Notes |
+|------|--------|-------|
+| Read | `get()` | Clones current value |
+| Read | `with_read(f)` | Borrowed read without cloning |
+| Write | `set(v)` | Sync notify |
+| Write | `set_async(v)` | Async notify in batches |
+| Write | `update(f)` | Compute-and-set under one lock, notify once |
+| Write | `set_if_changed(v)` | No-op if equal (PartialEq) |
+| Obs | `subscribe(cb)` | Returns ObserverId |
+| Obs | `subscribe_filtered(cb, pred)` | Predicate-gated |
+| Obs | `subscribe_immediate(cb)` | Calls once immediately |
+| Obs | `unsubscribe(id)` | Returns bool |
+| Obs | `observer_count()` | Count observers |
+| Obs | `clear_observers()` | Remove all observers |
 
 ## License
 
