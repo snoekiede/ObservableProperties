@@ -22,15 +22,27 @@
 //! let property = ObservableProperty::new(42);
 //!
 //! // Subscribe to changes
-//! let observer_id = property.subscribe(Arc::new(|old_value, new_value| {
+//! let observer_id = match property.subscribe(Arc::new(|old_value, new_value| {
 //!     println!("Value changed from {} to {}", old_value, new_value);
-//! })).unwrap();
+//! })) {
+//!     Ok(id) => id,
+//!     Err(e) => {
+//!         eprintln!("Failed to subscribe observer: {}", e);
+//!         return; // or handle error appropriately
+//!     }
+//! };
 //!
 //! // Change the value (triggers observer)
-//! property.set(100).unwrap();
+//! if let Err(e) = property.set(100) {
+//!     eprintln!("Failed to set property value: {}", e);
+//!     return; // or handle error appropriately
+//! }
 //!
 //! // Unsubscribe when done
-//! property.unsubscribe(observer_id).unwrap();
+//! match property.unsubscribe(observer_id) {
+//!     Ok(_) => println!("Observer unsubscribed successfully"),
+//!     Err(e) => eprintln!("Failed to unsubscribe observer: {}", e),
+//! }
 //! ```
 //!
 //! ## Multi-threading Example
@@ -44,14 +56,25 @@
 //! let property_clone = property.clone();
 //!
 //! // Subscribe from one thread
-//! property.subscribe(Arc::new(|old, new| {
+//! match property.subscribe(Arc::new(|old, new| {
 //!     println!("Value changed: {} -> {}", old, new);
-//! })).unwrap();
+//! })) {
+//!     Ok(_) => println!("Observer subscribed successfully"),
+//!     Err(e) => {
+//!         eprintln!("Failed to subscribe observer: {}", e);
+//!         return; // or handle error appropriately
+//!     }
+//! };
 //!
 //! // Modify from another thread
-//! thread::spawn(move || {
-//!     property_clone.set(42).unwrap();
-//! }).join().unwrap();
+//! match thread::spawn(move || {
+//!     if let Err(e) = property_clone.set(42) {
+//!         eprintln!("Failed to set property value: {}", e);
+//!     }
+//! }).join() {
+//!     Ok(_) => println!("Thread completed successfully"),
+//!     Err(e) => eprintln!("Thread panicked: {:?}", e),
+//! };
 //! ```
 
 use std::collections::HashMap;
@@ -142,12 +165,23 @@ pub type ObserverId = usize;
 ///
 /// let property = ObservableProperty::new("initial".to_string());
 ///
-/// let observer_id = property.subscribe(Arc::new(|old, new| {
+/// let observer_id = match property.subscribe(Arc::new(|old, new| {
 ///     println!("Changed from '{}' to '{}'", old, new);
-/// })).unwrap();
+/// })) {
+///     Ok(id) => id,
+///     Err(e) => {
+///         eprintln!("Failed to subscribe observer: {}", e);
+///         return; // or handle error appropriately
+///     }
+/// };
 ///
-/// property.set("updated".to_string()).unwrap(); // Prints: Changed from 'initial' to 'updated'
-/// property.unsubscribe(observer_id).unwrap();
+/// if let Err(e) = property.set("updated".to_string()) {
+///     eprintln!("Failed to set property value: {}", e);
+/// } // Prints: Changed from 'initial' to 'updated'
+/// 
+/// if let Err(e) = property.unsubscribe(observer_id) {
+///     eprintln!("Failed to unsubscribe observer: {}", e);
+/// }
 /// ```
 pub struct ObservableProperty<T> {
     inner: Arc<RwLock<InnerProperty<T>>>,
@@ -172,7 +206,10 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
     /// use observable_property::ObservableProperty;
     ///
     /// let property = ObservableProperty::new(42);
-    /// assert_eq!(property.get().unwrap(), 42);
+    /// match property.get() {
+    ///     Ok(value) => assert_eq!(value, 42),
+    ///     Err(e) => eprintln!("Failed to get property value: {}", e),
+    /// }
     /// ```
     pub fn new(initial_value: T) -> Self {
         Self {
@@ -200,7 +237,10 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
     /// use observable_property::ObservableProperty;
     ///
     /// let property = ObservableProperty::new("hello".to_string());
-    /// assert_eq!(property.get().unwrap(), "hello");
+    /// match property.get() {
+    ///     Ok(value) => assert_eq!(value, "hello"),
+    ///     Err(e) => eprintln!("Failed to get property value: {}", e),
+    /// }
     /// ```
     pub fn get(&self) -> Result<T, PropertyError> {
         self.inner
@@ -236,11 +276,20 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
     ///
     /// let property = ObservableProperty::new(10);
     /// 
-    /// property.subscribe(Arc::new(|old, new| {
+    /// match property.subscribe(Arc::new(|old, new| {
     ///     println!("Value changed from {} to {}", old, new);
-    /// })).unwrap();
+    /// })) {
+    ///     Ok(_) => println!("Observer subscribed successfully"),
+    ///     Err(e) => {
+    ///         eprintln!("Failed to subscribe observer: {}", e);
+    ///         return; // or handle error appropriately
+    ///     }
+    /// };
     ///
-    /// property.set(20).unwrap(); // Triggers observer notification
+    /// // Triggers observer notification
+    /// if let Err(e) = property.set(20) {
+    ///     eprintln!("Failed to set property value: {}", e);
+    /// }
     /// ```
     pub fn set(&self, new_value: T) -> Result<(), PropertyError> {
         let (old_value, observers_snapshot) = {
@@ -296,14 +345,22 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
     ///
     /// let property = ObservableProperty::new(0);
     /// 
-    /// property.subscribe(Arc::new(|old, new| {
+    /// match property.subscribe(Arc::new(|old, new| {
     ///     // This observer does slow work but won't block the caller
     ///     std::thread::sleep(Duration::from_millis(100));
     ///     println!("Slow observer: {} -> {}", old, new);
-    /// })).unwrap();
+    /// })) {
+    ///     Ok(_) => println!("Observer subscribed successfully"),
+    ///     Err(e) => {
+    ///         eprintln!("Failed to subscribe observer: {}", e);
+    ///         return; // or handle error appropriately
+    ///     }
+    /// };
     ///
     /// // This returns immediately even though observer is slow
-    /// property.set_async(42).unwrap();
+    /// if let Err(e) = property.set_async(42) {
+    ///     eprintln!("Failed to set property value asynchronously: {}", e);
+    /// }
     /// ```
     pub fn set_async(&self, new_value: T) -> Result<(), PropertyError> {
         let (old_value, observers_snapshot) = {
@@ -325,7 +382,7 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
         }
 
         const MAX_THREADS: usize = 4;
-        let observers_per_thread = (observers_snapshot.len() + MAX_THREADS - 1) / MAX_THREADS;
+        let observers_per_thread = observers_snapshot.len().div_ceil(MAX_THREADS);
 
         for batch in observers_snapshot.chunks(observers_per_thread) {
             let batch_observers = batch.to_vec();
@@ -368,12 +425,20 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
     ///
     /// let property = ObservableProperty::new(0);
     ///
-    /// let observer_id = property.subscribe(Arc::new(|old_value, new_value| {
+    /// let observer_id = match property.subscribe(Arc::new(|old_value, new_value| {
     ///     println!("Property changed from {} to {}", old_value, new_value);
-    /// })).unwrap();
+    /// })) {
+    ///     Ok(id) => id,
+    ///     Err(e) => {
+    ///         eprintln!("Failed to subscribe observer: {}", e);
+    ///         return; // or handle error appropriately
+    ///     }
+    /// };
     ///
     /// // Later, unsubscribe using the returned ID
-    /// property.unsubscribe(observer_id).unwrap();
+    /// if let Err(e) = property.unsubscribe(observer_id) {
+    ///     eprintln!("Failed to unsubscribe observer: {}", e);
+    /// }
     /// ```
     pub fn subscribe(&self, observer: Observer<T>) -> Result<ObserverId, PropertyError> {
         let mut prop = self
@@ -408,13 +473,31 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
     /// use std::sync::Arc;
     ///
     /// let property = ObservableProperty::new(0);
-    /// let id = property.subscribe(Arc::new(|_, _| {})).unwrap();
+    /// 
+    /// // First, subscribe an observer
+    /// let id = match property.subscribe(Arc::new(|_, _| {})) {
+    ///     Ok(id) => id,
+    ///     Err(e) => {
+    ///         eprintln!("Failed to subscribe observer: {}", e);
+    ///         return; // or handle error appropriately
+    ///     }
+    /// };
     ///
-    /// let was_removed = property.unsubscribe(id).unwrap();
-    /// assert!(was_removed); // Observer existed and was removed
+    /// // Then unsubscribe it
+    /// match property.unsubscribe(id) {
+    ///     Ok(was_removed) => {
+    ///         assert!(was_removed); // Observer existed and was removed
+    ///     },
+    ///     Err(e) => eprintln!("Failed to unsubscribe observer: {}", e),
+    /// }
     ///
-    /// let was_removed_again = property.unsubscribe(id).unwrap();
-    /// assert!(!was_removed_again); // Observer no longer exists
+    /// // Try unsubscribing again - should return false
+    /// match property.unsubscribe(id) {
+    ///     Ok(was_removed_again) => {
+    ///         assert!(!was_removed_again); // Observer no longer exists
+    ///     },
+    ///     Err(e) => eprintln!("Failed to unsubscribe observer: {}", e),
+    /// }
     /// ```
     pub fn unsubscribe(&self, id: ObserverId) -> Result<bool, PropertyError> {
         let mut prop = self
@@ -451,14 +534,31 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
     /// let property = ObservableProperty::new(0);
     ///
     /// // Only notify when value increases
-    /// let id = property.subscribe_filtered(
+    /// let id = match property.subscribe_filtered(
     ///     Arc::new(|old, new| println!("Value increased: {} -> {}", old, new)),
     ///     |old, new| new > old
-    /// ).unwrap();
+    /// ) {
+    ///     Ok(id) => id,
+    ///     Err(e) => {
+    ///         eprintln!("Failed to subscribe filtered observer: {}", e);
+    ///         return; // or handle error appropriately
+    ///     }
+    /// };
     ///
-    /// property.set(10).unwrap(); // Triggers observer (0 -> 10)
-    /// property.set(5).unwrap();  // Does NOT trigger observer (10 -> 5)
-    /// property.set(15).unwrap(); // Triggers observer (5 -> 15)
+    /// // Triggers observer (0 -> 10)
+    /// if let Err(e) = property.set(10) {
+    ///     eprintln!("Failed to set property value: {}", e);
+    /// }
+    /// 
+    /// // Does NOT trigger observer (10 -> 5)
+    /// if let Err(e) = property.set(5) {
+    ///     eprintln!("Failed to set property value: {}", e);
+    /// }
+    /// 
+    /// // Triggers observer (5 -> 15)
+    /// if let Err(e) = property.set(15) {
+    ///     eprintln!("Failed to set property value: {}", e);
+    /// }
     /// ```
     pub fn subscribe_filtered<F>(
         &self,
@@ -495,12 +595,20 @@ impl<T: Clone> Clone for ObservableProperty<T> {
     /// let property1 = ObservableProperty::new(42);
     /// let property2 = property1.clone();
     ///
-    /// property2.subscribe(Arc::new(|old, new| {
+    /// match property2.subscribe(Arc::new(|old, new| {
     ///     println!("Observer on property2 saw change: {} -> {}", old, new);
-    /// })).unwrap();
+    /// })) {
+    ///     Ok(_) => println!("Observer subscribed successfully"),
+    ///     Err(e) => {
+    ///         eprintln!("Failed to subscribe observer: {}", e);
+    ///         return; // or handle error appropriately
+    ///     }
+    /// };
     ///
     /// // This change through property1 will trigger the observer on property2
-    /// property1.set(100).unwrap();
+    /// if let Err(e) = property1.set(100) {
+    ///     eprintln!("Failed to set property value: {}", e);
+    /// }
     /// ```
     fn clone(&self) -> Self {
         Self {
