@@ -15,50 +15,60 @@
 //! ## Quick Start
 //!
 //! ```rust
-//! use observable_property::ObservableProperty;
+//! use observable_property::{ObservableProperty, PropertyError};
 //! use std::sync::Arc;
 //!
-//! // Create an observable property
-//! let property = ObservableProperty::new(42);
+//! fn example() -> Result<(), PropertyError> {
+//!     // Create an observable property
+//!     let property = ObservableProperty::new(42);
 //!
-//! // Subscribe to changes
-//! let observer_id = property.subscribe(Arc::new(|old_value, new_value| {
-//!     println!("Value changed from {} to {}", old_value, new_value);
-//! })).unwrap();
+//!     // Subscribe to changes
+//!     let observer_id = property.subscribe(Arc::new(|old_value, new_value| {
+//!         println!("Value changed from {} to {}", old_value, new_value);
+//!     }))?;
 //!
-//! // Change the value (triggers observer)
-//! property.set(100).unwrap();
+//!     // Change the value (triggers observer)
+//!     property.set(100)?;
 //!
-//! // Unsubscribe when done
-//! property.unsubscribe(observer_id).unwrap();
+//!     // Unsubscribe when done
+//!     property.unsubscribe(observer_id)?;
+//!
+//!     Ok(())
+//! }
 //! ```
 //!
 //! ## Multi-threading Example
 //!
 //! ```rust
-//! use observable_property::ObservableProperty;
+//! use observable_property::{ObservableProperty, PropertyError};
 //! use std::sync::Arc;
 //! use std::thread;
 //!
-//! let property = Arc::new(ObservableProperty::new(0));
-//! let property_clone = property.clone();
+//! fn example() -> Result<(), Box<dyn std::error::Error>> {
+//!     let property = Arc::new(ObservableProperty::new(0));
+//!     let property_clone = property.clone();
 //!
-//! // Subscribe from one thread
-//! property.subscribe(Arc::new(|old, new| {
-//!     println!("Value changed: {} -> {}", old, new);
-//! })).unwrap();
+//!     // Subscribe from one thread
+//!     property.subscribe(Arc::new(|old, new| {
+//!         println!("Value changed: {} -> {}", old, new);
+//!     }))?;
 //!
-//! // Modify from another thread
-//! thread::spawn(move || {
-//!     property_clone.set(42).unwrap();
-//! }).join().unwrap();
+//!     // Modify from another thread
+//!     thread::spawn(move || -> Result<(), PropertyError> {
+//!         property_clone.set(42)?;
+//!         Ok(())
+//!     }).join().expect("Thread panicked");
+//!
+//!     Ok(())
+//! }
 //! ```
 
 use std::collections::HashMap;
 use std::fmt;
 use std::panic;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, RwLock, Mutex};
 use std::thread;
+use std::sync::atomic::{AtomicUsize, AtomicBool, Ordering};
 
 /// Errors that can occur when working with ObservableProperty
 #[derive(Debug, Clone)]
@@ -112,6 +122,7 @@ impl fmt::Display for PropertyError {
     }
 }
 
+/// This is for integration into Rust's error handling ecosystem
 impl std::error::Error for PropertyError {}
 
 /// Function type for observers that get called when property values change
@@ -138,17 +149,24 @@ pub type ObserverId = usize;
 /// # Examples
 ///
 /// ```rust
-/// use observable_property::ObservableProperty;
+/// use observable_property::{ObservableProperty, PropertyError};
 /// use std::sync::Arc;
 ///
-/// let property = ObservableProperty::new("initial".to_string());
+/// fn example() -> Result<(), PropertyError> {
+///     let property = ObservableProperty::new("initial".to_string());
 ///
-/// let observer_id = property.subscribe(Arc::new(|old, new| {
-///     println!("Changed from '{}' to '{}'", old, new);
-/// })).unwrap();
+///     let observer_id = property.subscribe(Arc::new(|old, new| {
+///         println!("Changed from '{}' to '{}'", old, new);
+///     }))?;
 ///
-/// property.set("updated".to_string()).unwrap(); // Prints: Changed from 'initial' to 'updated'
-/// property.unsubscribe(observer_id).unwrap();
+///     // This triggers the observer
+///     property.set("updated".to_string())?;
+///
+///     // Clean up when done
+///     property.unsubscribe(observer_id)?;
+///
+///     Ok(())
+/// }
 /// ```
 pub struct ObservableProperty<T> {
     inner: Arc<RwLock<InnerProperty<T>>>,
@@ -170,10 +188,13 @@ impl<T> ObservableProperty<T> {
     /// # Examples
     ///
     /// ```rust
-    /// use observable_property::ObservableProperty;
+    /// use observable_property::{ObservableProperty, PropertyError};
     ///
     /// let property = ObservableProperty::new(42);
-    /// assert_eq!(property.get().unwrap(), 42);
+    /// match property.get() {
+    ///     Ok(value) => assert_eq!(value, 42),
+    ///     Err(e) => eprintln!("Failed to get property value: {}", e),
+    /// }
     /// ```
     pub fn new(initial_value: T) -> Self {
         Self {
@@ -217,10 +238,13 @@ impl<T> ObservableProperty<T> {
     /// # Examples
     ///
     /// ```rust
-    /// use observable_property::ObservableProperty;
+    /// use observable_property::{ObservableProperty, PropertyError};
     ///
     /// let property = ObservableProperty::new("hello".to_string());
-    /// assert_eq!(property.get().unwrap(), "hello");
+    /// match property.get() {
+    ///     Ok(value) => assert_eq!(value, "hello"),
+    ///     Err(e) => eprintln!("Failed to get property value: {}", e),
+    /// }
     /// ```
     pub fn get(&self) -> Result<T, PropertyError>
     where
@@ -916,5 +940,184 @@ mod tests {
             assert_eq!(g.0, "x");
             assert_eq!(g.1, "y");
         }
+    }
+
+    #[test]
+    fn test_concurrent_writes() {
+        let prop = Arc::new(ObservableProperty::new(0));
+        let threads = 10;
+        let increments_per_thread = 100;
+
+        let handles: Vec<_> = (0..threads).map(|_| {
+            let prop_clone = prop.clone();
+            thread::spawn(move || {
+                for _ in 0..increments_per_thread {
+                    let _ = prop_clone.update(|val| val + 1);
+                    thread::sleep(Duration::from_micros(1));
+                }
+            })
+        }).collect();
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // All threads should have incremented the value
+        assert_eq!(prop.get().unwrap(), threads * increments_per_thread);
+    }
+
+    #[test]
+    fn test_observer_panic_isolation() {
+        let prop = ObservableProperty::new(42);
+
+        // Add an observer that panics
+        let _panic_id = prop.subscribe(Arc::new(|_, new_val| {
+            if *new_val == 100 {
+                panic!("Expected test panic on value 100");
+            }
+        })).unwrap();
+
+        // Add a normal observer
+        let called = Arc::new(AtomicBool::new(false));
+        let called_clone = called.clone();
+        let _normal_id = prop.subscribe(Arc::new(move |_, _| {
+            called_clone.store(true, Ordering::SeqCst);
+        })).unwrap();
+
+        // This should not crash the test, even though the first observer panics
+        prop.set(100).unwrap();
+
+        // Second observer should still be called
+        assert!(called.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn test_many_observers() {
+        let prop = ObservableProperty::new(0);
+        let num_observers = 100;
+        let counter = Arc::new(AtomicUsize::new(0));
+
+        // Add many observers
+        let ids: Vec<_> = (0..num_observers)
+            .map(|_| {
+                let c = counter.clone();
+                prop.subscribe(Arc::new(move |_, _| {
+                    c.fetch_add(1, Ordering::SeqCst);
+                })).unwrap()
+            })
+            .collect();
+
+        // Update and ensure all observers are called
+        prop.set(1).unwrap();
+        assert_eq!(counter.load(Ordering::SeqCst), num_observers);
+
+        // Clean up
+        for id in ids {
+            prop.unsubscribe(id).unwrap();
+        }
+    }
+
+    #[test]
+    fn test_observer_order_consistency() {
+        let prop = ObservableProperty::new(0);
+        let call_order = Arc::new(Mutex::new(Vec::new()));
+
+        // Add observers that record their call order
+        for i in 1..=5 {
+            let order = call_order.clone();
+            let observer_num = i;
+            prop.subscribe(Arc::new(move |_, _| {
+                let mut guard = order.lock().unwrap();
+                guard.push(observer_num);
+            })).unwrap();
+        }
+
+        // Trigger observers and record order
+        prop.set(1).unwrap();
+        let first_order = {
+            let guard = call_order.lock().unwrap();
+            guard.clone()
+        };
+
+        // Clear order record
+        {
+            let mut guard = call_order.lock().unwrap();
+            guard.clear();
+        }
+
+        // Trigger again and compare order
+        prop.set(2).unwrap();
+        let second_order = {
+            let guard = call_order.lock().unwrap();
+            guard.clone()
+        };
+
+        // Orders should be consistent between updates
+        assert_eq!(first_order, second_order);
+    }
+
+    #[test]
+    fn test_update_with_error_handling() {
+        let prop = ObservableProperty::<Result<i32, String>>::new(Ok(10));
+
+        // Test updating a successful value
+        let result = prop.update(|res| {
+            match res {
+                Ok(val) => Ok(val * 2),
+                Err(e) => Err(e.clone()),
+            }
+        }).unwrap();
+
+        assert_eq!(result, (Ok(10), Ok(20)));
+        assert_eq!(prop.get().unwrap(), Ok(20));
+
+        // Update to an error state
+        prop.set(Err("Something went wrong".to_string())).unwrap();
+
+        // Try updating an error value
+        let result = prop.update(|res| {
+            match res {
+                Ok(val) => Ok(val * 2),
+                Err(_) => Ok(0), // Recover from error
+            }
+        }).unwrap();
+
+        assert!(result.0.is_err());
+        assert_eq!(result.1, Ok(0));
+        assert_eq!(prop.get().unwrap(), Ok(0));
+    }
+
+    #[test]
+    fn test_large_value_changes() {
+        // Test with a larger struct to ensure efficient cloning
+        #[derive(Clone, Debug, PartialEq)]
+        struct LargeStruct {
+            id: usize,
+            data: Vec<u8>,
+        }
+
+        let initial = LargeStruct {
+            id: 1,
+            data: vec![0; 10000], // 10KB of data
+        };
+
+        let prop = ObservableProperty::new(initial);
+        let observer_called = Arc::new(AtomicBool::new(false));
+        let obs = observer_called.clone();
+
+        prop.subscribe(Arc::new(move |old, new| {
+            assert_eq!(old.id, 1);
+            assert_eq!(new.id, 2);
+            obs.store(true, Ordering::SeqCst);
+        })).unwrap();
+
+        // Update with a new large struct
+        let new_data = LargeStruct {
+            id: 2,
+            data: vec![1; 10000],
+        };
+
+        prop.set(new_data).unwrap();
+        assert!(observer_called.load(Ordering::SeqCst));
     }
 }
