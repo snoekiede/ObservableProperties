@@ -9,7 +9,7 @@
 //! - **Observer pattern**: Subscribe to property changes with callbacks
 //! - **Filtered observers**: Only notify when specific conditions are met
 //! - **Async notifications**: Non-blocking observer notifications with background threads
-//! - **Panic isolation**: Observer panics don't crash the system
+//! - **Panic isolation**: Observer panics do not crash the system
 //! - **Type-safe**: Generic implementation works with any `Clone + Send + Sync` type
 //!
 //! ## Quick Start
@@ -66,34 +66,34 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::panic;
-use std::sync::{Arc, RwLock, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
-use std::sync::atomic::{AtomicUsize, AtomicBool, Ordering};
 
 /// Errors that can occur when working with ObservableProperty
 #[derive(Debug, Clone)]
 pub enum PropertyError {
     /// Failed to acquire a read lock on the property
-    ReadLockError { 
+    ReadLockError {
         /// Context describing what operation was being attempted
-        context: String 
+        context: String,
     },
     /// Failed to acquire a write lock on the property  
-    WriteLockError { 
+    WriteLockError {
         /// Context describing what operation was being attempted
-        context: String 
+        context: String,
     },
     /// Attempted to unsubscribe an observer that doesn't exist
-    ObserverNotFound { 
+    ObserverNotFound {
         /// The ID of the observer that wasn't found
-        id: usize 
+        id: usize,
     },
     /// The property's lock has been poisoned due to a panic in another thread
     PoisonedLock,
     /// An observer function encountered an error during execution
-    ObserverError { 
+    ObserverError {
         /// Description of what went wrong
-        reason: String 
+        reason: String,
     },
 }
 
@@ -183,7 +183,7 @@ impl<T> ObservableProperty<T> {
     ///
     /// # Arguments
     ///
-    /// * `initial_value` - The starting value for this property
+    /// * `initial_value` - The initial value for this property
     ///
     /// # Examples
     ///
@@ -221,7 +221,10 @@ impl<T> ObservableProperty<T> {
     where
         F: FnOnce(&mut T) -> R,
     {
-        let mut guard = self.inner.write().map_err(|_| PropertyError::PoisonedLock)?;
+        let mut guard = self
+            .inner
+            .write()
+            .map_err(|_| PropertyError::PoisonedLock)?;
         Ok(f(&mut guard.value))
     }
 
@@ -282,7 +285,7 @@ impl<T> ObservableProperty<T> {
     /// use std::sync::Arc;
     ///
     /// let property = ObservableProperty::new(10);
-    /// 
+    ///
     /// property.subscribe(Arc::new(|old, new| {
     ///     println!("Value changed from {} to {}", old, new);
     /// })).unwrap();
@@ -305,7 +308,7 @@ impl<T> ObservableProperty<T> {
             (old_value, observers_snapshot)
         };
 
-    notify_observers(&old_value, &new_value, observers_snapshot);
+        notify_observers(&old_value, &new_value, observers_snapshot);
 
         Ok(())
     }
@@ -337,7 +340,7 @@ impl<T> ObservableProperty<T> {
     /// use std::time::Duration;
     ///
     /// let property = ObservableProperty::new(0);
-    /// 
+    ///
     /// property.subscribe(Arc::new(|old, new| {
     ///     // This observer does slow work but won't block the caller
     ///     std::thread::sleep(Duration::from_millis(100));
@@ -354,8 +357,8 @@ impl<T> ObservableProperty<T> {
         let (old_value, observers_snapshot) = {
             let mut prop = self
                 .inner
-        .write()
-        .map_err(|_| PropertyError::PoisonedLock)?;
+                .write()
+                .map_err(|_| PropertyError::PoisonedLock)?;
 
             let old_value = prop.value.clone();
             prop.value = new_value.clone();
@@ -367,9 +370,9 @@ impl<T> ObservableProperty<T> {
             return Ok(());
         }
 
-    const MAX_THREADS: usize = 4;
-    let batches = observers_snapshot.len().min(MAX_THREADS);
-    let observers_per_thread = observers_snapshot.len().div_ceil(batches);
+        const MAX_THREADS: usize = 4;
+        let batches = observers_snapshot.len().min(MAX_THREADS);
+        let observers_per_thread = observers_snapshot.len().div_ceil(batches);
 
         for batch in observers_snapshot.chunks(observers_per_thread) {
             let batch_observers = batch.to_vec();
@@ -490,7 +493,7 @@ impl<T> ObservableProperty<T> {
             (old_value, new_value, observers_snapshot)
         };
 
-    notify_observers(&old_value, &new_value, observers_snapshot);
+        notify_observers(&old_value, &new_value, observers_snapshot);
 
         Ok((old_value, new_value))
     }
@@ -581,8 +584,8 @@ impl<T> ObservableProperty<T> {
         filter: F,
     ) -> Result<ObserverId, PropertyError>
     where
-    T: 'static,
-    F: Fn(&T, &T) -> bool + Send + Sync + 'static,
+        T: 'static,
+        F: Fn(&T, &T) -> bool + Send + Sync + 'static,
     {
         let filter = Arc::new(filter);
         let filtered_observer = Arc::new(move |old_val: &T, new_val: &T| {
@@ -667,11 +670,13 @@ impl<T: Clone + std::fmt::Debug> std::fmt::Debug for ObservableProperty<T> {
     /// Debug implementation that shows the current value if accessible
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.get() {
-            Ok(value) => f.debug_struct("ObservableProperty")
+            Ok(value) => f
+                .debug_struct("ObservableProperty")
                 .field("value", &value)
                 .field("observers_count", &"[hidden]")
                 .finish(),
-            Err(_) => f.debug_struct("ObservableProperty")
+            Err(_) => f
+                .debug_struct("ObservableProperty")
                 .field("value", &"[inaccessible]")
                 .field("observers_count", &"[hidden]")
                 .finish(),
@@ -694,18 +699,18 @@ mod tests {
     #[test]
     fn test_property_creation_and_basic_operations() {
         let prop = ObservableProperty::new(42);
-        
+
         // Test initial value
         match prop.get() {
             Ok(value) => assert_eq!(value, 42),
             Err(e) => panic!("Failed to get initial value: {}", e),
         }
-        
+
         // Test setting value
         if let Err(e) = prop.set(100) {
             panic!("Failed to set value: {}", e);
         }
-        
+
         match prop.get() {
             Ok(value) => assert_eq!(value, 100),
             Err(e) => panic!("Failed to get updated value: {}", e),
@@ -718,11 +723,11 @@ mod tests {
         let notification_count = Arc::new(AtomicUsize::new(0));
         let last_old_value = Arc::new(RwLock::new(String::new()));
         let last_new_value = Arc::new(RwLock::new(String::new()));
-        
+
         let count_clone = notification_count.clone();
         let old_clone = last_old_value.clone();
         let new_clone = last_new_value.clone();
-        
+
         let observer_id = match prop.subscribe(Arc::new(move |old, new| {
             count_clone.fetch_add(1, Ordering::SeqCst);
             if let Ok(mut old_val) = old_clone.write() {
@@ -735,30 +740,30 @@ mod tests {
             Ok(id) => id,
             Err(e) => panic!("Failed to subscribe observer: {}", e),
         };
-        
+
         // Change value and verify notification
         if let Err(e) = prop.set("changed".to_string()) {
             panic!("Failed to set property value: {}", e);
         }
-        
+
         assert_eq!(notification_count.load(Ordering::SeqCst), 1);
-        
+
         match last_old_value.read() {
             Ok(old_val) => assert_eq!(*old_val, "initial"),
             Err(e) => panic!("Failed to read old value: {:?}", e),
         }
-        
+
         match last_new_value.read() {
             Ok(new_val) => assert_eq!(*new_val, "changed"),
             Err(e) => panic!("Failed to read new value: {:?}", e),
         }
-        
+
         // Test unsubscription
         match prop.unsubscribe(observer_id) {
             Ok(was_present) => assert!(was_present),
             Err(e) => panic!("Failed to unsubscribe observer: {}", e),
         }
-        
+
         // Change value again - should not notify
         if let Err(e) = prop.set("not_notified".to_string()) {
             panic!("Failed to set property value after unsubscribe: {}", e);
@@ -771,38 +776,38 @@ mod tests {
         let prop = ObservableProperty::new(0i32);
         let notification_count = Arc::new(AtomicUsize::new(0));
         let count_clone = notification_count.clone();
-        
+
         // Observer only triggered when value increases
         let observer_id = match prop.subscribe_filtered(
             Arc::new(move |_, _| {
                 count_clone.fetch_add(1, Ordering::SeqCst);
             }),
-            |old, new| new > old
+            |old, new| new > old,
         ) {
             Ok(id) => id,
             Err(e) => panic!("Failed to subscribe filtered observer: {}", e),
         };
-        
+
         // Should trigger (0 -> 5)
         if let Err(e) = prop.set(5) {
             panic!("Failed to set property value to 5: {}", e);
         }
         assert_eq!(notification_count.load(Ordering::SeqCst), 1);
-        
+
         // Should NOT trigger (5 -> 3)
         if let Err(e) = prop.set(3) {
             panic!("Failed to set property value to 3: {}", e);
         }
         assert_eq!(notification_count.load(Ordering::SeqCst), 1);
-        
+
         // Should trigger (3 -> 10)
         if let Err(e) = prop.set(10) {
             panic!("Failed to set property value to 10: {}", e);
         }
         assert_eq!(notification_count.load(Ordering::SeqCst), 2);
-        
+
         match prop.unsubscribe(observer_id) {
-            Ok(_) => {},
+            Ok(_) => {}
             Err(e) => panic!("Failed to unsubscribe filtered observer: {}", e),
         }
     }
@@ -812,20 +817,22 @@ mod tests {
         let prop = Arc::new(ObservableProperty::new(42i32));
         let num_threads = 10;
         let reads_per_thread = 100;
-        
-        let handles: Vec<_> = (0..num_threads).map(|_| {
-            let prop_clone = prop.clone();
-            thread::spawn(move || {
-                for _ in 0..reads_per_thread {
-                    match prop_clone.get() {
-                        Ok(value) => assert_eq!(value, 42),
-                        Err(e) => panic!("Failed to read property value: {}", e),
+
+        let handles: Vec<_> = (0..num_threads)
+            .map(|_| {
+                let prop_clone = prop.clone();
+                thread::spawn(move || {
+                    for _ in 0..reads_per_thread {
+                        match prop_clone.get() {
+                            Ok(value) => assert_eq!(value, 42),
+                            Err(e) => panic!("Failed to read property value: {}", e),
+                        }
+                        thread::sleep(Duration::from_millis(1));
                     }
-                    thread::sleep(Duration::from_millis(1));
-                }
+                })
             })
-        }).collect();
-        
+            .collect();
+
         for handle in handles {
             if let Err(e) = handle.join() {
                 panic!("Thread failed to complete: {:?}", e);
@@ -838,7 +845,7 @@ mod tests {
         let prop = ObservableProperty::new(0i32);
         let slow_observer_count = Arc::new(AtomicUsize::new(0));
         let count_clone = slow_observer_count.clone();
-        
+
         // Add observer that simulates slow work
         let _id = match prop.subscribe(Arc::new(move |_, _| {
             thread::sleep(Duration::from_millis(50));
@@ -847,28 +854,28 @@ mod tests {
             Ok(id) => id,
             Err(e) => panic!("Failed to subscribe slow observer: {}", e),
         };
-        
+
         // Test synchronous set (should be slow)
         let start = std::time::Instant::now();
         if let Err(e) = prop.set(1) {
             panic!("Failed to set property value synchronously: {}", e);
         }
         let sync_duration = start.elapsed();
-        
+
         // Test asynchronous set (should be fast)
         let start = std::time::Instant::now();
         if let Err(e) = prop.set_async(2) {
             panic!("Failed to set property value asynchronously: {}", e);
         }
         let async_duration = start.elapsed();
-        
+
         // Async should be much faster than sync
         assert!(async_duration < sync_duration);
         assert!(async_duration.as_millis() < 10); // Should be very fast
-        
+
         // Wait for async observer to complete
         thread::sleep(Duration::from_millis(100));
-        
+
         // Both observers should have been called
         assert_eq!(slow_observer_count.load(Ordering::SeqCst), 2);
     }
@@ -924,11 +931,13 @@ mod tests {
         let prop = ObservableProperty::new(String::from("x"));
         let last = Arc::new(RwLock::new((String::new(), String::new())));
         let l = last.clone();
-        let _ = prop.subscribe_immediate(Arc::new(move |old, new| {
-            let mut guard = l.write().unwrap();
-            guard.0 = old.clone();
-            guard.1 = new.clone();
-        })).unwrap();
+        let _ = prop
+            .subscribe_immediate(Arc::new(move |old, new| {
+                let mut guard = l.write().unwrap();
+                guard.0 = old.clone();
+                guard.1 = new.clone();
+            }))
+            .unwrap();
         {
             let g = last.read().unwrap();
             assert_eq!(g.0, "x");
@@ -948,15 +957,17 @@ mod tests {
         let threads = 10;
         let increments_per_thread = 100;
 
-        let handles: Vec<_> = (0..threads).map(|_| {
-            let prop_clone = prop.clone();
-            thread::spawn(move || {
-                for _ in 0..increments_per_thread {
-                    let _ = prop_clone.update(|val| val + 1);
-                    thread::sleep(Duration::from_micros(1));
-                }
+        let handles: Vec<_> = (0..threads)
+            .map(|_| {
+                let prop_clone = prop.clone();
+                thread::spawn(move || {
+                    for _ in 0..increments_per_thread {
+                        let _ = prop_clone.update(|val| val + 1);
+                        thread::sleep(Duration::from_micros(1));
+                    }
+                })
             })
-        }).collect();
+            .collect();
 
         for h in handles {
             h.join().unwrap();
@@ -971,18 +982,22 @@ mod tests {
         let prop = ObservableProperty::new(42);
 
         // Add an observer that panics
-        let _panic_id = prop.subscribe(Arc::new(|_, new_val| {
-            if *new_val == 100 {
-                panic!("Expected test panic on value 100");
-            }
-        })).unwrap();
+        let _panic_id = prop
+            .subscribe(Arc::new(|_, new_val| {
+                if *new_val == 100 {
+                    panic!("Expected test panic on value 100");
+                }
+            }))
+            .unwrap();
 
         // Add a normal observer
         let called = Arc::new(AtomicBool::new(false));
         let called_clone = called.clone();
-        let _normal_id = prop.subscribe(Arc::new(move |_, _| {
-            called_clone.store(true, Ordering::SeqCst);
-        })).unwrap();
+        let _normal_id = prop
+            .subscribe(Arc::new(move |_, _| {
+                called_clone.store(true, Ordering::SeqCst);
+            }))
+            .unwrap();
 
         // This should not crash the test, even though the first observer panics
         prop.set(100).unwrap();
@@ -1003,7 +1018,8 @@ mod tests {
                 let c = counter.clone();
                 prop.subscribe(Arc::new(move |_, _| {
                     c.fetch_add(1, Ordering::SeqCst);
-                })).unwrap()
+                }))
+                .unwrap()
             })
             .collect();
 
@@ -1029,7 +1045,8 @@ mod tests {
             prop.subscribe(Arc::new(move |_, _| {
                 let mut guard = order.lock().unwrap();
                 guard.push(observer_num);
-            })).unwrap();
+            }))
+            .unwrap();
         }
 
         // Trigger observers and record order
@@ -1061,12 +1078,12 @@ mod tests {
         let prop = ObservableProperty::<Result<i32, String>>::new(Ok(10));
 
         // Test updating a successful value
-        let result = prop.update(|res| {
-            match res {
+        let result = prop
+            .update(|res| match res {
                 Ok(val) => Ok(val * 2),
                 Err(e) => Err(e.clone()),
-            }
-        }).unwrap();
+            })
+            .unwrap();
 
         assert_eq!(result, (Ok(10), Ok(20)));
         assert_eq!(prop.get().unwrap(), Ok(20));
@@ -1075,12 +1092,14 @@ mod tests {
         prop.set(Err("Something went wrong".to_string())).unwrap();
 
         // Try updating an error value
-        let result = prop.update(|res| {
-            match res {
-                Ok(val) => Ok(val * 2),
-                Err(_) => Ok(0), // Recover from error
-            }
-        }).unwrap();
+        let result = prop
+            .update(|res| {
+                match res {
+                    Ok(val) => Ok(val * 2),
+                    Err(_) => Ok(0), // Recover from error
+                }
+            })
+            .unwrap();
 
         assert!(result.0.is_err());
         assert_eq!(result.1, Ok(0));
@@ -1109,7 +1128,8 @@ mod tests {
             assert_eq!(old.id, 1);
             assert_eq!(new.id, 2);
             obs.store(true, Ordering::SeqCst);
-        })).unwrap();
+        }))
+        .unwrap();
 
         // Update with a new large struct
         let new_data = LargeStruct {
