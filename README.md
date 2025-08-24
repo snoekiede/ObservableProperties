@@ -24,7 +24,7 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-observable-property = "0.1.0"
+observable-property = "0.2.0"
 ```
 
 ## Usage
@@ -35,19 +35,32 @@ observable-property = "0.1.0"
 use observable_property::ObservableProperty;
 use std::sync::Arc;
 
-// Create an observable property
-let property = ObservableProperty::new(42);
+fn main() -> Result<(), observable_property::PropertyError> {
+    // Create an observable property
+    let property = ObservableProperty::new(42);
 
-// Subscribe to changes
-let observer_id = property.subscribe(Arc::new(|old_value, new_value| {
-    println!("Value changed from {} to {}", old_value, new_value);
-})).unwrap();
+    // Subscribe to changes
+    let observer_id = property.subscribe(Arc::new(|old_value, new_value| {
+        println!("Value changed from {} to {}", old_value, new_value);
+    })).map_err(|e| {
+        eprintln!("Failed to subscribe: {}", e);
+        e
+    })?;
 
-// Change the value (triggers observer)
-property.set(100).unwrap(); // Prints: Value changed from 42 to 100
+    // Change the value (triggers observer)
+    property.set(100).map_err(|e| {
+        eprintln!("Failed to set value: {}", e);
+        e
+    })?; // Prints: Value changed from 42 to 100
 
-// Unsubscribe when done
-property.unsubscribe(observer_id).unwrap();
+    // Unsubscribe when done
+    property.unsubscribe(observer_id).map_err(|e| {
+        eprintln!("Failed to unsubscribe: {}", e);
+        e
+    })?;
+    
+    Ok(())
+}
 ```
 
 ### Multi-threading Example
@@ -57,18 +70,27 @@ use observable_property::ObservableProperty;
 use std::sync::Arc;
 use std::thread;
 
-let property = Arc::new(ObservableProperty::new(0));
-let property_clone = property.clone();
+fn main() -> Result<(), observable_property::PropertyError> {
+    let property = Arc::new(ObservableProperty::new(0));
+    let property_clone = property.clone();
 
-// Subscribe from one thread
-property.subscribe(Arc::new(|old, new| {
-    println!("Value changed: {} -> {}", old, new);
-})).unwrap();
+    // Subscribe from one thread
+    property.subscribe(Arc::new(|old, new| {
+        println!("Value changed: {} -> {}", old, new);
+    })).map_err(|e| {
+        eprintln!("Failed to subscribe: {}", e);
+        e
+    })?;
 
-// Modify from another thread
-thread::spawn(move || {
-    property_clone.set(42).unwrap();
-}).join().unwrap();
+    // Modify from another thread
+    thread::spawn(move || {
+        if let Err(e) = property_clone.set(42) {
+            eprintln!("Failed to set value: {}", e);
+        }
+    }).join().expect("Thread panicked");
+    
+    Ok(())
+}
 ```
 
 ### Filtered Observers
@@ -77,17 +99,35 @@ thread::spawn(move || {
 use observable_property::ObservableProperty;
 use std::sync::Arc;
 
-let counter = ObservableProperty::new(0);
+fn main() -> Result<(), observable_property::PropertyError> {
+    let counter = ObservableProperty::new(0);
 
-// Only notify when value increases
-let observer_id = counter.subscribe_filtered(
-    Arc::new(|old, new| println!("Increased: {} -> {}", old, new)),
-    |old, new| new > old
-).unwrap();
+    // Only notify when value increases
+    let observer_id = counter.subscribe_filtered(
+        Arc::new(|old, new| println!("Increased: {} -> {}", old, new)),
+        |old, new| new > old
+    ).map_err(|e| {
+        eprintln!("Failed to subscribe: {}", e);
+        e
+    })?;
 
-counter.set(5).unwrap();  // Triggers observer: "Increased: 0 -> 5"
-counter.set(3).unwrap();  // Does NOT trigger observer
-counter.set(10).unwrap(); // Triggers observer: "Increased: 3 -> 10"
+    counter.set(5).map_err(|e| {
+        eprintln!("Failed to set value: {}", e);
+        e
+    })?;  // Triggers observer: "Increased: 0 -> 5"
+    
+    counter.set(3).map_err(|e| {
+        eprintln!("Failed to set value: {}", e);
+        e
+    })?;  // Does NOT trigger observer
+    
+    counter.set(10).map_err(|e| {
+        eprintln!("Failed to set value: {}", e);
+        e
+    })?; // Triggers observer: "Increased: 3 -> 10"
+    
+    Ok(())
+}
 ```
 
 ### Async Notifications
@@ -99,16 +139,26 @@ use observable_property::ObservableProperty;
 use std::sync::Arc;
 use std::time::Duration;
 
-let property = ObservableProperty::new(0);
+fn main() -> Result<(), observable_property::PropertyError> {
+    let property = ObservableProperty::new(0);
 
-property.subscribe(Arc::new(|old, new| {
-    // This slow observer won't block the caller
-    std::thread::sleep(Duration::from_millis(100));
-    println!("Slow observer: {} -> {}", old, new);
-})).unwrap();
+    property.subscribe(Arc::new(|old, new| {
+        // This slow observer won't block the caller
+        std::thread::sleep(Duration::from_millis(100));
+        println!("Slow observer: {} -> {}", old, new);
+    })).map_err(|e| {
+        eprintln!("Failed to subscribe: {}", e);
+        e
+    })?;
 
-// This returns immediately even though observer is slow
-property.set_async(42).unwrap();
+    // This returns immediately even though observer is slow
+    property.set_async(42).map_err(|e| {
+        eprintln!("Failed to set value asynchronously: {}", e);
+        e
+    })?;
+    
+    Ok(())
+}
 ```
 
 ### Complex Types
@@ -125,19 +175,29 @@ struct Person {
     age: u32,
 }
 
-let person_property = ObservableProperty::new(Person {
-    name: "Alice".to_string(),
-    age: 30,
-});
+fn main() -> Result<(), observable_property::PropertyError> {
+    let person_property = ObservableProperty::new(Person {
+        name: "Alice".to_string(),
+        age: 30,
+    });
 
-person_property.subscribe(Arc::new(|old_person, new_person| {
-    println!("Person changed: {:?} -> {:?}", old_person, new_person);
-})).unwrap();
+    person_property.subscribe(Arc::new(|old_person, new_person| {
+        println!("Person changed: {:?} -> {:?}", old_person, new_person);
+    })).map_err(|e| {
+        eprintln!("Failed to subscribe: {}", e);
+        e
+    })?;
 
-person_property.set(Person {
-    name: "Alice".to_string(),
-    age: 31,
-}).unwrap();
+    person_property.set(Person {
+        name: "Alice".to_string(),
+        age: 31,
+    }).map_err(|e| {
+        eprintln!("Failed to set person: {}", e);
+        e
+    })?;
+    
+    Ok(())
+}
 ```
 
 ## Error Handling
@@ -147,12 +207,16 @@ All operations return `Result` types with descriptive errors:
 ```rust
 use observable_property::{ObservableProperty, PropertyError};
 
-let property = ObservableProperty::new(42);
+fn main() -> Result<(), PropertyError> {
+    let property = ObservableProperty::new(42);
 
-match property.get() {
-    Ok(value) => println!("Current value: {}", value),
-    Err(PropertyError::PoisonedLock) => println!("Lock was poisoned!"),
-    Err(e) => println!("Other error: {}", e),
+    match property.get() {
+        Ok(value) => println!("Current value: {}", value),
+        Err(PropertyError::PoisonedLock) => println!("Lock was poisoned!"),
+        Err(e) => println!("Other error: {}", e),
+    }
+
+    Ok(())
 }
 ```
 

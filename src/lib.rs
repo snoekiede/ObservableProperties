@@ -24,13 +24,23 @@
 //! // Subscribe to changes
 //! let observer_id = property.subscribe(Arc::new(|old_value, new_value| {
 //!     println!("Value changed from {} to {}", old_value, new_value);
-//! })).unwrap();
+//! })).map_err(|e| {
+//!     eprintln!("Failed to subscribe: {}", e);
+//!     e
+//! })?;
 //!
 //! // Change the value (triggers observer)
-//! property.set(100).unwrap();
+//! property.set(100).map_err(|e| {
+//!     eprintln!("Failed to set value: {}", e);
+//!     e
+//! })?;
 //!
 //! // Unsubscribe when done
-//! property.unsubscribe(observer_id).unwrap();
+//! property.unsubscribe(observer_id).map_err(|e| {
+//!     eprintln!("Failed to unsubscribe: {}", e);
+//!     e
+//! })?;
+//! # Ok::<(), observable_property::PropertyError>(())
 //! ```
 //!
 //! ## Multi-threading Example
@@ -46,12 +56,18 @@
 //! // Subscribe from one thread
 //! property.subscribe(Arc::new(|old, new| {
 //!     println!("Value changed: {} -> {}", old, new);
-//! })).unwrap();
+//! })).map_err(|e| {
+//!     eprintln!("Failed to subscribe: {}", e);
+//!     e
+//! })?;
 //!
 //! // Modify from another thread
 //! thread::spawn(move || {
-//!     property_clone.set(42).unwrap();
-//! }).join().unwrap();
+//!     if let Err(e) = property_clone.set(42) {
+//!         eprintln!("Failed to set value: {}", e);
+//!     }
+//! }).join().expect("Thread panicked");
+//! # Ok::<(), observable_property::PropertyError>(())
 //! ```
 
 use std::collections::HashMap;
@@ -144,10 +160,21 @@ pub type ObserverId = usize;
 ///
 /// let observer_id = property.subscribe(Arc::new(|old, new| {
 ///     println!("Changed from '{}' to '{}'", old, new);
-/// })).unwrap();
+/// })).map_err(|e| {
+///     eprintln!("Failed to subscribe: {}", e);
+///     e
+/// })?;
 ///
-/// property.set("updated".to_string()).unwrap(); // Prints: Changed from 'initial' to 'updated'
-/// property.unsubscribe(observer_id).unwrap();
+/// property.set("updated".to_string()).map_err(|e| {
+///     eprintln!("Failed to set value: {}", e);
+///     e
+/// })?; // Prints: Changed from 'initial' to 'updated'
+///
+/// property.unsubscribe(observer_id).map_err(|e| {
+///     eprintln!("Failed to unsubscribe: {}", e);
+///     e
+/// })?;
+/// # Ok::<(), observable_property::PropertyError>(())
 /// ```
 pub struct ObservableProperty<T> {
     inner: Arc<RwLock<InnerProperty<T>>>,
@@ -172,7 +199,10 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
     /// use observable_property::ObservableProperty;
     ///
     /// let property = ObservableProperty::new(42);
-    /// assert_eq!(property.get().unwrap(), 42);
+    /// match property.get() {
+    ///     Ok(value) => assert_eq!(value, 42),
+    ///     Err(e) => eprintln!("Failed to get property value: {}", e),
+    /// }
     /// ```
     pub fn new(initial_value: T) -> Self {
         Self {
@@ -200,7 +230,10 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
     /// use observable_property::ObservableProperty;
     ///
     /// let property = ObservableProperty::new("hello".to_string());
-    /// assert_eq!(property.get().unwrap(), "hello");
+    /// match property.get() {
+    ///     Ok(value) => assert_eq!(value, "hello"),
+    ///     Err(e) => eprintln!("Failed to get property value: {}", e),
+    /// }
     /// ```
     pub fn get(&self) -> Result<T, PropertyError> {
         self.inner
@@ -238,9 +271,16 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
     /// 
     /// property.subscribe(Arc::new(|old, new| {
     ///     println!("Value changed from {} to {}", old, new);
-    /// })).unwrap();
+    /// })).map_err(|e| {
+    ///     eprintln!("Failed to subscribe: {}", e);
+    ///     e
+    /// })?;
     ///
-    /// property.set(20).unwrap(); // Triggers observer notification
+    /// property.set(20).map_err(|e| {
+    ///     eprintln!("Failed to set property value: {}", e);
+    ///     e
+    /// })?; // Triggers observer notification
+    /// # Ok::<(), observable_property::PropertyError>(())
     /// ```
     pub fn set(&self, new_value: T) -> Result<(), PropertyError> {
         let (old_value, observers_snapshot) = {
@@ -300,10 +340,17 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
     ///     // This observer does slow work but won't block the caller
     ///     std::thread::sleep(Duration::from_millis(100));
     ///     println!("Slow observer: {} -> {}", old, new);
-    /// })).unwrap();
+    /// })).map_err(|e| {
+    ///     eprintln!("Failed to subscribe: {}", e);
+    ///     e
+    /// })?;
     ///
     /// // This returns immediately even though observer is slow
-    /// property.set_async(42).unwrap();
+    /// property.set_async(42).map_err(|e| {
+    ///     eprintln!("Failed to set value asynchronously: {}", e);
+    ///     e
+    /// })?;
+    /// # Ok::<(), observable_property::PropertyError>(())
     /// ```
     pub fn set_async(&self, new_value: T) -> Result<(), PropertyError> {
         let (old_value, observers_snapshot) = {
@@ -370,10 +417,17 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
     ///
     /// let observer_id = property.subscribe(Arc::new(|old_value, new_value| {
     ///     println!("Property changed from {} to {}", old_value, new_value);
-    /// })).unwrap();
+    /// })).map_err(|e| {
+    ///     eprintln!("Failed to subscribe observer: {}", e);
+    ///     e
+    /// })?;
     ///
     /// // Later, unsubscribe using the returned ID
-    /// property.unsubscribe(observer_id).unwrap();
+    /// property.unsubscribe(observer_id).map_err(|e| {
+    ///     eprintln!("Failed to unsubscribe observer: {}", e);
+    ///     e
+    /// })?;
+    /// # Ok::<(), observable_property::PropertyError>(())
     /// ```
     pub fn subscribe(&self, observer: Observer<T>) -> Result<ObserverId, PropertyError> {
         let mut prop = self
