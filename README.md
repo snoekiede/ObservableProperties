@@ -256,6 +256,14 @@ This crate is designed with safety as a primary concern:
 
 * No unsafe code is used
 
+## Disclaimer
+
+This crate is provided "as is", without warranty of any kind, express or implied. The authors and contributors are not responsible for any damages or liability arising from the use of this software. While efforts have been made to ensure the crate functions correctly, it may contain bugs or issues in certain scenarios. Users should thoroughly test the crate in their specific environment before deploying to production.
+
+Performance characteristics may vary depending on system configuration, observer complexity, and concurrency patterns. The observer pattern implementation may introduce overhead in systems with very high frequency property changes or large numbers of observers.
+
+By using this crate, you acknowledge that you have read and understood this disclaimer.
+
 ## License
 
 Licensed under either of
