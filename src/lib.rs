@@ -766,4 +766,191 @@ mod tests {
         // Both observers should have been called
         assert_eq!(slow_observer_count.load(Ordering::SeqCst), 2);
     }
+
+    #[test]
+    fn test_lock_poisoning() {
+        // Create a property that we'll poison
+        let prop = Arc::new(ObservableProperty::new(0));
+        let prop_clone = prop.clone();
+
+        // Create a thread that will deliberately poison the lock
+        let poison_thread = thread::spawn(move || {
+            // Get write lock and then panic, which will poison the lock
+            let _guard = prop_clone.inner.write().unwrap();
+            panic!("Deliberate panic to poison the lock");
+        });
+
+        // Wait for the thread to complete (it will panic)
+        let _ = poison_thread.join();
+
+        // Now the lock should be poisoned, verify all operations return appropriate errors
+        match prop.get() {
+            Ok(_) => panic!("get() should fail on a poisoned lock"),
+            Err(e) => match e {
+                PropertyError::PoisonedLock => {} // Expected error
+                _ => panic!("Expected PoisonedLock error, got: {:?}", e),
+            }
+        }
+
+        match prop.set(42) {
+            Ok(_) => panic!("set() should fail on a poisoned lock"),
+            Err(e) => match e {
+                PropertyError::WriteLockError { .. } | PropertyError::PoisonedLock => {} // Either is acceptable
+                _ => panic!("Expected lock-related error, got: {:?}", e),
+            }
+        }
+
+        match prop.subscribe(Arc::new(|_, _| {})) {
+            Ok(_) => panic!("subscribe() should fail on a poisoned lock"),
+            Err(e) => match e {
+                PropertyError::WriteLockError { .. } | PropertyError::PoisonedLock => {} // Either is acceptable
+                _ => panic!("Expected lock-related error, got: {:?}", e),
+            }
+        }
+    }
+
+    #[test]
+    fn test_observer_panic_isolation() {
+        let prop = ObservableProperty::new(0);
+        let call_counts = Arc::new(AtomicUsize::new(0));
+
+        // First observer will panic
+        let panic_observer_id = prop.subscribe(Arc::new(|_, _| {
+            panic!("This observer deliberately panics");
+        })).unwrap();
+
+        // Second observer should still be called despite first one panicking
+        let counts = call_counts.clone();
+        let normal_observer_id = prop.subscribe(Arc::new(move |_, _| {
+            counts.fetch_add(1, Ordering::SeqCst);
+        })).unwrap();
+
+        // Trigger the observers - this shouldn't panic despite the first observer panicking
+        prop.set(42).unwrap();
+
+        // Verify the second observer was still called
+        assert_eq!(call_counts.load(Ordering::SeqCst), 1);
+
+        // Clean up
+        prop.unsubscribe(panic_observer_id).unwrap();
+        prop.unsubscribe(normal_observer_id).unwrap();
+    }
+
+    #[test]
+    fn test_observer_id_edge_cases() {
+        let prop = ObservableProperty::new(0);
+        let mut observer_ids = Vec::new();
+
+        // Helper function to generate many observer IDs
+        // Using a separate function instead of a closure to avoid borrow issues
+        fn subscribe_observers(prop: &ObservableProperty<i32>, count: usize) -> Vec<ObserverId> {
+            let mut ids = Vec::with_capacity(count);
+            for _ in 0..count {
+                let id = prop.subscribe(Arc::new(|_, _| {})).unwrap();
+                ids.push(id);
+            }
+            ids
+        }
+
+        // 1. Test very large number of observers (testing ID generation)
+        let new_ids = subscribe_observers(&prop, 1000);
+        observer_ids.extend(new_ids);
+
+        // 2. Verify all IDs are unique
+        let unique_count = observer_ids.iter().collect::<std::collections::HashSet<_>>().len();
+        assert_eq!(unique_count, observer_ids.len(), "Observer IDs should be unique");
+
+        // 3. Test unsubscribing all observers
+        for id in &observer_ids {
+            let result = prop.unsubscribe(*id).unwrap();
+            assert!(result, "Unsubscribe should return true for valid ID");
+        }
+
+        // 4. Create one more observer to ensure ID generation works after mass unsubscribe
+        let new_id = prop.subscribe(Arc::new(|_, _| {})).unwrap();
+
+        // Observe internal state to confirm next_id didn't reset (would require exposing internal state)
+        // Instead, we just verify the new ID doesn't duplicate any previous ID
+        assert!(!observer_ids.contains(&new_id), "New ID should not duplicate any previous ID");
+    }
+
+    #[test]
+    fn test_complex_custom_types() {
+        #[derive(Clone, Debug, PartialEq)]
+        struct ComplexType {
+            name: String,
+            values: Vec<i32>,
+            metadata: HashMap<String, String>,
+        }
+
+        let initial = ComplexType {
+            name: "Initial".to_string(),
+            values: vec![1, 2, 3],
+            metadata: {
+                let mut map = HashMap::new();
+                map.insert("created".to_string(), "now".to_string());
+                map
+            },
+        };
+
+        let property = ObservableProperty::new(initial.clone());
+        let received_values = Arc::new(RwLock::new(Vec::new()));
+
+        let values_clone = received_values.clone();
+        let observer_id = property.subscribe(Arc::new(move |_, new| {
+            if let Ok(mut values) = values_clone.write() {
+                values.push(new.clone());
+            }
+        })).unwrap();
+
+        let updated = ComplexType {
+            name: "Updated".to_string(),
+            values: vec![4, 5, 6],
+            metadata: {
+                let mut map = HashMap::new();
+                map.insert("created".to_string(), "now".to_string());
+                map.insert("updated".to_string(), "later".to_string());
+                map
+            },
+        };
+
+        // Set the new value
+        property.set(updated.clone()).unwrap();
+
+        // Verify the observer received the correct value
+        let received = received_values.read().unwrap();
+        assert_eq!(received.len(), 1);
+        assert_eq!(&received[0], &updated);
+
+        // Verify get() returns the updated value
+        let current = property.get().unwrap();
+        assert_eq!(current, updated);
+
+        property.unsubscribe(observer_id).unwrap();
+    }
+
+    #[test]
+    fn test_unsubscribe_nonexistent_observer() {
+        let property = ObservableProperty::new(0);
+
+        // Generate a valid observer ID
+        let valid_id = property.subscribe(Arc::new(|_, _| {})).unwrap();
+
+        // Create an ID that doesn't exist (valid_id + 1000 should not exist)
+        let nonexistent_id = valid_id + 1000;
+
+        // Test unsubscribing a nonexistent observer
+        match property.unsubscribe(nonexistent_id) {
+            Ok(was_present) => {
+                assert!(!was_present, "Unsubscribe should return false for nonexistent ID");
+            },
+            Err(e) => panic!("Unsubscribe returned error: {:?}", e),
+        }
+
+        // Also verify that unsubscribing twice returns false the second time
+        property.unsubscribe(valid_id).unwrap(); // First unsubscribe should return true
+
+        let result = property.unsubscribe(valid_id).unwrap();
+        assert!(!result, "Second unsubscribe should return false");
+    }
 }
