@@ -5,17 +5,11 @@ A thread-safe observable property implementation for Rust that allows you to obs
 ## Features
 
 * **Thread-safe**: Uses `Arc<RwLock<>>` for safe concurrent access
-
 * **Observer pattern**: Subscribe to property changes with callbacks
-
 * **Filtered observers**: Only notify when specific conditions are met
-
 * **Async notifications**: Non-blocking observer notifications with background threads
-
 * **Panic isolation**: Observer panics don't crash the system
-
 * **Type-safe**: Generic implementation works with any `Clone + Send + Sync + 'static` type
-
 * **Zero dependencies**: Uses only Rust standard library
 
 ## Quick Start
@@ -157,44 +151,8 @@ fn main() -> Result<(), observable_property::PropertyError> {
         e
     })?;
     
-    Ok(())
-}
-```
-
-### Complex Types
-
-Observable properties work with any type that implements the required traits:
-
-```rust
-use observable_property::ObservableProperty;
-use std::sync::Arc;
-
-#[derive(Clone, Debug)]
-struct Person {
-    name: String,
-    age: u32,
-}
-
-fn main() -> Result<(), observable_property::PropertyError> {
-    let person_property = ObservableProperty::new(Person {
-        name: "Alice".to_string(),
-        age: 30,
-    });
-
-    person_property.subscribe(Arc::new(|old_person, new_person| {
-        println!("Person changed: {:?} -> {:?}", old_person, new_person);
-    })).map_err(|e| {
-        eprintln!("Failed to subscribe: {}", e);
-        e
-    })?;
-
-    person_property.set(Person {
-        name: "Alice".to_string(),
-        age: 31,
-    }).map_err(|e| {
-        eprintln!("Failed to set person: {}", e);
-        e
-    })?;
+    // Continue with other work while observers run in background
+    println!("This prints immediately!");
     
     Ok(())
 }
@@ -202,78 +160,61 @@ fn main() -> Result<(), observable_property::PropertyError> {
 
 ## Error Handling
 
-All operations return `Result` types with descriptive errors:
+The library uses a comprehensive error system for robust error handling:
 
 ```rust
 use observable_property::{ObservableProperty, PropertyError};
+use std::sync::Arc;
 
-fn main() -> Result<(), PropertyError> {
+fn example() -> Result<(), PropertyError> {
     let property = ObservableProperty::new(42);
-
-    match property.get() {
-        Ok(value) => println!("Current value: {}", value),
-        Err(PropertyError::PoisonedLock) => println!("Lock was poisoned!"),
-        Err(e) => println!("Other error: {}", e),
+    
+    match property.subscribe(Arc::new(|old, new| {
+        println!("Value: {} -> {}", old, new);
+    })) {
+        Ok(observer_id) => {
+            // Successfully subscribed
+            property.set(100)?;
+            property.unsubscribe(observer_id)?;
+        }
+        Err(PropertyError::PoisonedLock) => {
+            eprintln!("Property lock was poisoned by a panic in another thread");
+        }
+        Err(PropertyError::WriteLockError { context }) => {
+            eprintln!("Failed to acquire write lock: {}", context);
+        }
+        Err(e) => {
+            eprintln!("Other error: {}", e);
+        }
     }
-
+    
     Ok(())
 }
 ```
 
 ## Performance Considerations
 
-* **Read operations** are very fast and can be performed concurrently from multiple threads
+- **Observers**: Each observer is called sequentially. For heavy computations, use `set_async()` to run observers in background threads.
+- **Lock contention**: The property uses a single `RwLock` internally. Consider having fewer, larger properties rather than many small ones.
+- **Memory**: Observer functions are stored as `Arc<dyn Fn>` and kept until unsubscribed.
 
-* **Write operations** are serialized but optimize for quick lock release
+## Thread Safety
 
-* **Synchronous notifications** block the setter until all observers complete
+All operations are thread-safe:
+- Multiple threads can read the property value simultaneously
+- Only one thread can modify the property at a time
+- Observer notifications happen outside the lock to minimize contention
+- Observer panics are isolated and don't affect other observers or the property
 
-* **Asynchronous notifications** return immediately and run observers in background threads
+## Contributing
 
-* **Observer panics** are isolated and won't affect other observers or crash the system
-
-## Examples
-
-Run the included examples to see more usage patterns:
-
-```bash
-# Basic usage example
-cargo run --example basic
-
-# Multithreaded usage with performance comparisons
-cargo run --example multithreaded
-```
-
-## Safety
-
-This crate is designed with safety as a primary concern:
-
-* Thread-safe access patterns prevent data races
-
-* Observer panics are caught and isolated
-
-* Lock poisoning is properly handled and reported
-
-* No unsafe code is used
-
-## Disclaimer
-
-This crate is provided "as is", without warranty of any kind, express or implied. The authors and contributors are not responsible for any damages or liability arising from the use of this software. While efforts have been made to ensure the crate functions correctly, it may contain bugs or issues in certain scenarios. Users should thoroughly test the crate in their specific environment before deploying to production.
-
-Performance characteristics may vary depending on system configuration, observer complexity, and concurrency patterns. The observer pattern implementation may introduce overhead in systems with very high frequency property changes or large numbers of observers.
-
-By using this crate, you acknowledge that you have read and understood this disclaimer.
+Contributions are welcome! Please feel free to submit a Pull Request.
 
 ## License
 
-Licensed under either of
+This project is licensed under either of
 
-* Apache License, Version 2.0, ([LICENSE-APACHE](https://www.google.com/search?q=LICENSE-APACHE) or <http://www.apache.org/licenses/LICENSE-2.0>)
-
-* MIT license ([LICENSE-MIT](https://www.google.com/search?q=LICENSE-MIT) or <http://opensource.org/licenses/MIT>)
+* Apache License, Version 2.0, ([LICENSE-APACHE](LICENSE-APACHE) or http://www.apache.org/licenses/LICENSE-2.0)
+* MIT license ([LICENSE-MIT](LICENSE-MIT) or http://opensource.org/licenses/MIT)
 
 at your option.
-
-### Contribution
-
-Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in the work by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without any additional terms or conditions.
