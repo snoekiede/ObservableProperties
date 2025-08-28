@@ -23,6 +23,7 @@ name = "observable_property"
 path = "src/lib.rs"
 
 [dependencies]
+observable-property-macros = { path = "observable-property-macros", version = "0.2.2", optional = true }
 
 [dev-dependencies]
 # Add any test-only dependencies here if needed
@@ -30,11 +31,6 @@ path = "src/lib.rs"
 [features]
 default = ["macros"]
 macros = ["observable-property-macros"]
-
-[dependencies.observable-property-macros]
-version = "0.2.2"
-path = "macros"
-optional = true
 
 [[example]]
 name = "basic"

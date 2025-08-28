@@ -81,7 +81,7 @@
 //! })?;
 //! # Ok::<(), observable_property::PropertyError>(())
 //! ```
-
+pub use observable_property_macros::*;
 use std::collections::HashMap;
 use std::fmt;
 use std::panic;
@@ -609,9 +609,9 @@ impl<T: Clone> Clone for ObservableProperty<T> {
     }
 }
 
-impl<T: Clone + std::fmt::Debug + Send + Sync + 'static> std::fmt::Debug for ObservableProperty<T> {
+impl<T: Clone + fmt::Debug + Send + Sync + 'static> fmt::Debug for ObservableProperty<T> {
     /// Debug implementation that shows the current value if accessible
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.get() {
             Ok(value) => f.debug_struct("ObservableProperty")
                 .field("value", &value)

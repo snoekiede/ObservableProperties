@@ -40,6 +40,7 @@ fn main() -> Result<(), observable_property::PropertyError> {
         id: u64,
     }
 
+
     let person = Person::new(
         "Charlie".to_string(),  // ← Direct values!
         25,                     // ← Direct values!
