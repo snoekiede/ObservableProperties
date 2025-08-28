@@ -11,18 +11,19 @@
 //! - **Async notifications**: Non-blocking observer notifications with background threads
 //! - **Panic isolation**: Observer panics don't crash the system
 //! - **Type-safe**: Generic implementation works with any `Clone + Send + Sync` type
+//! - **Macros**: Convenient macros to automatically wrap properties
 //!
 //! ## Quick Start
 //!
 //! ```rust
-//! use observable_property::ObservableProperty;
+//! use observable_property::{ObservableProperty, observable};
 //! use std::sync::Arc;
 //!
-//! // Create an observable property
-//! let property = ObservableProperty::new(42);
+//! // Using the macro for automatic wrapping
+//! let value = observable!(42);
 //!
 //! // Subscribe to changes
-//! let observer_id = property.subscribe(Arc::new(|old_value, new_value| {
+//! let observer_id = value.subscribe(Arc::new(|old_value, new_value| {
 //!     println!("Value changed from {} to {}", old_value, new_value);
 //! })).map_err(|e| {
 //!     eprintln!("Failed to subscribe: {}", e);
@@ -30,43 +31,54 @@
 //! })?;
 //!
 //! // Change the value (triggers observer)
-//! property.set(100).map_err(|e| {
+//! value.set(100).map_err(|e| {
 //!     eprintln!("Failed to set value: {}", e);
 //!     e
 //! })?;
 //!
 //! // Unsubscribe when done
-//! property.unsubscribe(observer_id).map_err(|e| {
+//! value.unsubscribe(observer_id).map_err(|e| {
 //!     eprintln!("Failed to unsubscribe: {}", e);
 //!     e
 //! })?;
 //! # Ok::<(), observable_property::PropertyError>(())
 //! ```
 //!
-//! ## Multi-threading Example
+//! ## Struct with Observable Fields
 //!
 //! ```rust
-//! use observable_property::ObservableProperty;
+//! use observable_property::{Observable, observable, ObservableProperty};
 //! use std::sync::Arc;
-//! use std::thread;
 //!
-//! let property = Arc::new(ObservableProperty::new(0));
-//! let property_clone = property.clone();
+//! #[derive(Observable)]
+//! struct Person {
+//!     #[observable]
+//!     name: ObservableProperty<String>,
+//!     #[observable]
+//!     age: ObservableProperty<i32>,
+//!     // Regular field (not observable)
+//!     id: u64,
+//! }
 //!
-//! // Subscribe from one thread
-//! property.subscribe(Arc::new(|old, new| {
-//!     println!("Value changed: {} -> {}", old, new);
+//! let person = Person {
+//!     name: observable!("Alice".to_string()),
+//!     age: observable!(30),
+//!     id: 12345,
+//! };
+//!
+//! // Subscribe to name changes using generated methods
+//! person.subscribe_name(Arc::new(|old, new| {
+//!     println!("Name changed from '{}' to '{}'", old, new);
 //! })).map_err(|e| {
-//!     eprintln!("Failed to subscribe: {}", e);
+//!     eprintln!("Failed to subscribe to name: {}", e);
 //!     e
 //! })?;
 //!
-//! // Modify from another thread
-//! thread::spawn(move || {
-//!     if let Err(e) = property_clone.set(42) {
-//!         eprintln!("Failed to set value: {}", e);
-//!     }
-//! }).join().expect("Thread panicked");
+//! // Set name using generated method
+//! person.set_name("Bob".to_string()).map_err(|e| {
+//!     eprintln!("Failed to set name: {}", e);
+//!     e
+//! })?;
 //! # Ok::<(), observable_property::PropertyError>(())
 //! ```
 
@@ -75,6 +87,10 @@ use std::fmt;
 use std::panic;
 use std::sync::{Arc, RwLock};
 use std::thread;
+
+// Re-export macros when the feature is enabled
+#[cfg(feature = "macros")]
+pub use observable_property_macros::*;
 
 /// Errors that can occur when working with ObservableProperty
 #[derive(Debug, Clone)]
@@ -1070,4 +1086,6 @@ mod tests {
 
         prop.unsubscribe(observer_id).unwrap();
     }
+
+    // Note: Macro tests are handled in integration tests to avoid self-reference issues
 }
