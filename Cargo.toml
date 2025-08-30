@@ -25,7 +25,7 @@ path = "src/lib.rs"
 [dependencies]
 
 [dev-dependencies]
-# Add any test-only dependencies here if needed
+observable_macros = { path = "observable_macros" }
 
 [[example]]
 name = "basic"
