@@ -13,6 +13,7 @@ dependencies = [
 name = "observable_macros"
 version = "0.1.0"
 dependencies = [
+ "observable-property",
  "proc-macro2",
  "quote",
  "syn",

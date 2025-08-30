@@ -47,6 +47,7 @@ pub fn observable(_attr: TokenStream, item: TokenStream) -> TokenStream {
     }
 
     let gen = quote! {
+        #[derive(Clone)]
         #vis struct #struct_name {
             #( #new_fields, )*
         }
@@ -121,6 +122,7 @@ pub fn derive_observable(input: TokenStream) -> TokenStream {
     }
 
     let gen = quote! {
+        #[derive(Clone)]
         #vis struct #observable_name {
             #( #obs_fields, )*
         }
