@@ -1,0 +1,8 @@
+error: Observable can only be derived for structs
+ --> tests/ui/enum_not_supported.rs:5:1
+  |
+5 | / enum BadEnum {
+6 | |     Variant1,
+7 | |     Variant2,
+8 | | }
+  | |_^

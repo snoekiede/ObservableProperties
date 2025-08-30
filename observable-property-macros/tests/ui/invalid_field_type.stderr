@@ -1,0 +1,5 @@
+error: Observable can only be derived for structs with named fields
+ --> tests/ui/invalid_field_type.rs:5:1
+  |
+5 | struct BadStruct(String, i32);
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

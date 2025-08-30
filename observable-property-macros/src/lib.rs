@@ -1,3 +1,5 @@
+// Export macros for use in integration tests and other crates
+// All proc macro exports are handled automatically by the #[proc_macro] attributes
 extern crate proc_macro;
 
 use proc_macro::TokenStream;
@@ -43,19 +45,19 @@ pub fn observable(input: TokenStream) -> TokenStream {
 /// Derive macro for creating structs with observable fields
 ///
 /// This macro generates getter and setter methods for fields marked with `#[observable]`.
-/// The fields must be of type `ObservableProperty<T>`.
+/// Fields must be of type `ObservableProperty<T>`.
 ///
 /// # Examples
 ///
 /// ```rust
-/// use observable_property::{Observable, observable};
+/// use observable_property::{Observable, ObservableProperty};
 ///
 /// #[derive(Observable)]
 /// struct Person {
 ///     #[observable]
-///     name: String,
+///     name: ObservableProperty<String>,
 ///     #[observable]
-///     age: i32,
+///     age: ObservableProperty<i32>,
 ///     id: u64, // Regular field
 /// }
 /// ```
@@ -87,6 +89,7 @@ pub fn derive_observable(input: TokenStream) -> TokenStream {
     let mut methods = Vec::new();
     let mut constructor_params = Vec::new();
     let mut constructor_init = Vec::new();
+    let mut observable_types = Vec::new(); // Track types that need trait bounds
 
     for field in fields {
         let field_name = field.ident.as_ref().unwrap();
@@ -98,12 +101,19 @@ pub fn derive_observable(input: TokenStream) -> TokenStream {
         });
 
         if has_observable_attr {
-            // Extract the inner type from ObservableProperty<T>
+            // Store the original field type for constructor params
+            let param_type;
+
+            // Check if the field is already ObservableProperty<T>
             let inner_type = if let syn::Type::Path(type_path) = field_type {
                 if let Some(segment) = type_path.path.segments.last() {
                     if segment.ident == "ObservableProperty" {
+                        // Field is already ObservableProperty<T>
                         if let syn::PathArguments::AngleBracketed(args) = &segment.arguments {
                             if let Some(syn::GenericArgument::Type(inner)) = args.args.first() {
+                                // Track this type for trait bounds
+                                observable_types.push(inner.clone());
+                                param_type = inner.clone();
                                 inner
                             } else {
                                 return syn::Error::new_spanned(
@@ -118,10 +128,11 @@ pub fn derive_observable(input: TokenStream) -> TokenStream {
                             ).to_compile_error().into();
                         }
                     } else {
-                        return syn::Error::new_spanned(
-                            field_type,
-                            "Observable fields must be of type ObservableProperty<T>"
-                        ).to_compile_error().into();
+                        // Field is not ObservableProperty<T>, use the field type directly
+                        // and wrap it in ObservableProperty<T>
+                        observable_types.push(field_type.clone());
+                        param_type = field_type.clone();
+                        field_type
                     }
                 } else {
                     return syn::Error::new_spanned(
@@ -130,14 +141,14 @@ pub fn derive_observable(input: TokenStream) -> TokenStream {
                     ).to_compile_error().into();
                 }
             } else {
-                return syn::Error::new_spanned(
-                    field_type,
-                    "Observable fields must be of type ObservableProperty<T>"
-                ).to_compile_error().into();
+                // Field is not a path type, use as is
+                observable_types.push(field_type.clone());
+                param_type = field_type.clone();
+                field_type
             };
 
             // Add parameter for constructor (raw type, not ObservableProperty)
-            constructor_params.push(quote! { #field_name: #inner_type });
+            constructor_params.push(quote! { #field_name: #param_type });
             // Add initialization (wrap in ObservableProperty)
             constructor_init.push(quote! {
                 #field_name: observable_property::ObservableProperty::new(#field_name)
@@ -198,6 +209,25 @@ pub fn derive_observable(input: TokenStream) -> TokenStream {
         }
     }
 
+    // Build where clause that includes trait bounds for observable types
+    let mut where_predicates = Vec::new();
+
+    // Add existing where clause predicates if any
+    if let Some(existing_where) = where_clause {
+        where_predicates.extend(existing_where.predicates.iter().cloned());
+    }
+
+    // Add trait bounds for observable types
+    for obs_type in observable_types {
+        where_predicates.push(syn::parse_quote! { #obs_type: Clone + Send + Sync + 'static });
+    }
+
+    let where_clause = if where_predicates.is_empty() {
+        None
+    } else {
+        Some(quote! { where #(#where_predicates),* })
+    };
+
     // Generate only the implementation, not the struct definition
     let expanded = quote! {
         impl #impl_generics #name #ty_generics #where_clause {
@@ -219,20 +249,26 @@ pub fn derive_observable(input: TokenStream) -> TokenStream {
 ///
 /// This is primarily used with the `Observable` derive macro to mark
 /// which fields should have observable getter/setter methods generated.
+/// Fields marked with this attribute will be automatically wrapped in `ObservableProperty<T>`.
 ///
 /// # Examples
 ///
-/// ```rust
-/// use observable_property::{Observable, observable_field};
+/// ```ignore
+/// use observable_property::Observable;
 ///
 /// #[derive(Observable)]
 /// struct Config {
 ///     #[observable]
-///     debug_mode: bool,
+///     debug_mode: bool,        // Will be wrapped as ObservableProperty<bool>
 ///     #[observable]
-///     max_connections: usize,
-///     version: String, // Not observable
+///     max_connections: usize,  // Will be wrapped as ObservableProperty<usize>
+///     version: String,         // Not observable
 /// }
+///
+/// // Usage example (not actually compiled):
+/// // let config = Config::new(false, 100, "1.0.0".to_string());
+/// // config.set_debug_mode(true).unwrap();
+/// // let value = config.get_debug_mode().unwrap();
 /// ```
 #[proc_macro_attribute]
 pub fn observable_field(_attr: TokenStream, item: TokenStream) -> TokenStream {
