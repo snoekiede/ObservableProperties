@@ -1,6 +1,6 @@
 # Observable Property
 
-A production-ready, thread-safe observable property implementation for Rust that allows you to observe changes to values across multiple threads. Built with comprehensive error handling and no `unwrap()` calls for maximum reliability.
+A thread-safe observable property implementation for Rust that allows you to observe changes to values across multiple threads. Built with comprehensive error handling and no `unwrap()` calls for maximum reliability.
 
 ## Features
 
@@ -21,7 +21,7 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-observable-property = "0.2.1"
+observable-property = "0.3.0"
 ```
 
 ## Usage
@@ -460,9 +460,20 @@ The library now follows Rust best practices for error handling, making it more r
 
 Contributions are welcome! Please feel free to submit a Pull Request.
 
+## Disclaimer
+
+This software is provided "as-is" without any express or implied warranties. While every effort has been made to ensure reliability and correctness, the authors and contributors make no guarantees regarding the software's performance, suitability for any particular purpose, or freedom from defects. Use this library at your own risk.
+
+Users are responsible for:
+- Testing the library thoroughly in their specific use cases
+- Implementing appropriate error handling and validation
+- Ensuring the library meets their performance and reliability requirements
+
+The comprehensive error handling and extensive test suite are designed to promote reliability, but do not constitute a warranty or guarantee of correctness.
+
 ## License
 
-This project is licensed under either of
+This project is licensed under either the:
 
 * Apache License, Version 2.0, ([LICENSE-APACHE](LICENSE-APACHE) or http://www.apache.org/licenses/LICENSE-2.0)
 * MIT license ([LICENSE-MIT](LICENSE-MIT) or http://opensource.org/licenses/MIT)
