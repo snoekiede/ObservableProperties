@@ -747,7 +747,7 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
             return Ok(());
         }
 
-        let observers_per_thread = observers_snapshot.len().div_ceil(MAX_THREADS);
+        let observers_per_thread = observers_snapshot.len().div_ceil(self.max_threads);
 
         for batch in observers_snapshot.chunks(observers_per_thread) {
             let batch_observers = batch.to_vec();
