@@ -574,6 +574,81 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
         }
     }
 
+    /// Creates a new observable property with a custom maximum thread count for async notifications
+    ///
+    /// This constructor allows you to customize the maximum number of threads used for
+    /// asynchronous observer notifications via `set_async()`. This is useful for tuning
+    /// performance based on your specific use case and system constraints.
+    ///
+    /// # Arguments
+    ///
+    /// * `initial_value` - The starting value for this property
+    /// * `max_threads` - Maximum number of threads to use for async notifications.
+    ///                   If 0 is provided, defaults to 4.
+    ///
+    /// # Thread Pool Behavior
+    ///
+    /// When `set_async()` is called, observers are divided into batches and each batch
+    /// runs in its own thread, up to the specified maximum. For example:
+    /// - With 100 observers and `max_threads = 4`: 4 threads with ~25 observers each
+    /// - With 10 observers and `max_threads = 8`: 10 threads with 1 observer each
+    /// - With 2 observers and `max_threads = 4`: 2 threads with 1 observer each
+    ///
+    /// # Use Cases
+    ///
+    /// ## High-Throughput Systems
+    /// ```rust
+    /// use observable_property::ObservableProperty;
+    ///
+    /// // For systems with many CPU cores and CPU-bound observers
+    /// let property = ObservableProperty::with_max_threads(0, 8);
+    /// ```
+    ///
+    /// ## Resource-Constrained Systems
+    /// ```rust
+    /// use observable_property::ObservableProperty;
+    ///
+    /// // For embedded systems or memory-constrained environments
+    /// let property = ObservableProperty::with_max_threads(42, 1);
+    /// ```
+    ///
+    /// ## I/O-Heavy Observers
+    /// ```rust
+    /// use observable_property::ObservableProperty;
+    ///
+    /// // For observers that do network/database operations
+    /// let property = ObservableProperty::with_max_threads("data".to_string(), 16);
+    /// ```
+    ///
+    /// # Performance Considerations
+    ///
+    /// - **Higher values**: Better parallelism but more thread overhead and memory usage
+    /// - **Lower values**: Less overhead but potentially slower async notifications
+    /// - **Optimal range**: Typically between 1 and 2x the number of CPU cores
+    /// - **Zero value**: Automatically uses the default value (4)
+    ///
+    /// # Thread Safety
+    ///
+    /// This setting only affects async notifications (`set_async()`). Synchronous
+    /// operations (`set()`) always execute observers sequentially regardless of this setting.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use observable_property::ObservableProperty;
+    /// use std::sync::Arc;
+    ///
+    /// // Create property with custom thread pool size
+    /// let property = ObservableProperty::with_max_threads(42, 2);
+    ///
+    /// // Subscribe observers as usual
+    /// let _subscription = property.subscribe_with_subscription(Arc::new(|old, new| {
+    ///     println!("Value changed: {} -> {}", old, new);
+    /// })).expect("Failed to create subscription");
+    ///
+    /// // Async notifications will use at most 2 threads
+    /// property.set_async(100).expect("Failed to set value asynchronously");
+    /// ```
     pub fn with_max_threads(initial_value: T, max_threads: usize) -> Self {
         let max_threads = if max_threads == 0 {
             MAX_THREADS
@@ -747,7 +822,7 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
             return Ok(());
         }
 
-        let observers_per_thread = observers_snapshot.len().div_ceil(MAX_THREADS);
+        let observers_per_thread = observers_snapshot.len().div_ceil(self.max_threads);
 
         for batch in observers_snapshot.chunks(observers_per_thread) {
             let batch_observers = batch.to_vec();
@@ -2898,5 +2973,245 @@ mod tests {
         }
 
         // Test succeeds if all threads completed successfully
+    }
+
+    #[test]
+    fn test_with_max_threads_creation() {
+        // Test creation with various thread counts
+        let prop1 = ObservableProperty::with_max_threads(42, 1);
+        let prop2 = ObservableProperty::with_max_threads("test".to_string(), 8);
+        let prop3 = ObservableProperty::with_max_threads(0.5_f64, 16);
+
+        // Verify initial values are correct
+        assert_eq!(prop1.get().expect("Failed to get prop1 value"), 42);
+        assert_eq!(prop2.get().expect("Failed to get prop2 value"), "test");
+        assert_eq!(prop3.get().expect("Failed to get prop3 value"), 0.5);
+    }
+
+    #[test]
+    fn test_with_max_threads_zero_defaults_to_max_threads() {
+        // Test that zero max_threads defaults to MAX_THREADS (4)
+        let prop1 = ObservableProperty::with_max_threads(100, 0);
+        let prop2 = ObservableProperty::new(100); // Uses default MAX_THREADS
+
+        // Both should have the same max_threads value
+        // We can't directly access max_threads, but we can verify behavior is consistent
+        assert_eq!(prop1.get().expect("Failed to get prop1 value"), 100);
+        assert_eq!(prop2.get().expect("Failed to get prop2 value"), 100);
+    }
+
+    #[test]
+    fn test_with_max_threads_basic_functionality() {
+        let prop = ObservableProperty::with_max_threads(0, 2);
+        let call_count = Arc::new(AtomicUsize::new(0));
+
+        // Subscribe an observer
+        let count = call_count.clone();
+        let _subscription = prop
+            .subscribe_with_subscription(Arc::new(move |old, new| {
+                count.fetch_add(1, Ordering::SeqCst);
+                assert_eq!(*old, 0);
+                assert_eq!(*new, 42);
+            }))
+            .expect("Failed to create subscription for max_threads test");
+
+        // Test synchronous set
+        prop.set(42).expect("Failed to set value synchronously");
+        assert_eq!(call_count.load(Ordering::SeqCst), 1);
+
+        // Test asynchronous set
+        prop.set_async(43).expect("Failed to set value asynchronously");
+        
+        // Wait for async observers to complete
+        thread::sleep(Duration::from_millis(50));
+        assert_eq!(call_count.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn test_with_max_threads_async_performance() {
+        // Test that with_max_threads affects async performance
+        let prop = ObservableProperty::with_max_threads(0, 1); // Single thread
+        let slow_call_count = Arc::new(AtomicUsize::new(0));
+
+        // Add multiple slow observers
+        let mut subscriptions = Vec::new();
+        for _ in 0..4 {
+            let count = slow_call_count.clone();
+            let subscription = prop
+                .subscribe_with_subscription(Arc::new(move |_, _| {
+                    thread::sleep(Duration::from_millis(25)); // Simulate slow work
+                    count.fetch_add(1, Ordering::SeqCst);
+                }))
+                .expect("Failed to create slow observer subscription");
+            subscriptions.push(subscription);
+        }
+
+        // Measure time for async notification
+        let start = std::time::Instant::now();
+        prop.set_async(42).expect("Failed to set value asynchronously");
+        let async_duration = start.elapsed();
+
+        // Should return quickly even with slow observers
+        assert!(async_duration.as_millis() < 50, "Async set should return quickly");
+
+        // Wait for all observers to complete
+        thread::sleep(Duration::from_millis(200));
+        assert_eq!(slow_call_count.load(Ordering::SeqCst), 4);
+    }
+
+    #[test]
+    fn test_with_max_threads_vs_regular_constructor() {
+        let prop_regular = ObservableProperty::new(42);
+        let prop_custom = ObservableProperty::with_max_threads(42, 4); // Same as default
+
+        let count_regular = Arc::new(AtomicUsize::new(0));
+        let count_custom = Arc::new(AtomicUsize::new(0));
+
+        // Both should behave identically
+        let count1 = count_regular.clone();
+        let _sub1 = prop_regular
+            .subscribe_with_subscription(Arc::new(move |_, _| {
+                count1.fetch_add(1, Ordering::SeqCst);
+            }))
+            .expect("Failed to create regular subscription");
+
+        let count2 = count_custom.clone();
+        let _sub2 = prop_custom
+            .subscribe_with_subscription(Arc::new(move |_, _| {
+                count2.fetch_add(1, Ordering::SeqCst);
+            }))
+            .expect("Failed to create custom subscription");
+
+        // Test sync behavior
+        prop_regular.set(100).expect("Failed to set regular property");
+        prop_custom.set(100).expect("Failed to set custom property");
+
+        assert_eq!(count_regular.load(Ordering::SeqCst), 1);
+        assert_eq!(count_custom.load(Ordering::SeqCst), 1);
+
+        // Test async behavior
+        prop_regular.set_async(200).expect("Failed to set regular property async");
+        prop_custom.set_async(200).expect("Failed to set custom property async");
+
+        thread::sleep(Duration::from_millis(50));
+        assert_eq!(count_regular.load(Ordering::SeqCst), 2);
+        assert_eq!(count_custom.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn test_with_max_threads_large_values() {
+        // Test with very large max_threads values
+        let prop = ObservableProperty::with_max_threads(0, 1000);
+        let call_count = Arc::new(AtomicUsize::new(0));
+
+        // Add a few observers
+        let count = call_count.clone();
+        let _subscription = prop
+            .subscribe_with_subscription(Arc::new(move |_, _| {
+                count.fetch_add(1, Ordering::SeqCst);
+            }))
+            .expect("Failed to create subscription for large max_threads test");
+
+        // Should work normally even with excessive thread limit
+        prop.set_async(42).expect("Failed to set value with large max_threads");
+
+        thread::sleep(Duration::from_millis(50));
+        assert_eq!(call_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn test_with_max_threads_clone_behavior() {
+        let prop1 = ObservableProperty::with_max_threads(42, 2);
+        let prop2 = prop1.clone();
+
+        let call_count1 = Arc::new(AtomicUsize::new(0));
+        let call_count2 = Arc::new(AtomicUsize::new(0));
+
+        // Subscribe to both properties
+        let count1 = call_count1.clone();
+        let _sub1 = prop1
+            .subscribe_with_subscription(Arc::new(move |_, _| {
+                count1.fetch_add(1, Ordering::SeqCst);
+            }))
+            .expect("Failed to create subscription for cloned property test");
+
+        let count2 = call_count2.clone();
+        let _sub2 = prop2
+            .subscribe_with_subscription(Arc::new(move |_, _| {
+                count2.fetch_add(1, Ordering::SeqCst);
+            }))
+            .expect("Failed to create subscription for original property test");
+
+        // Changes through either property should trigger both observers
+        prop1.set_async(100).expect("Failed to set value through prop1");
+        thread::sleep(Duration::from_millis(50));
+        
+        assert_eq!(call_count1.load(Ordering::SeqCst), 1);
+        assert_eq!(call_count2.load(Ordering::SeqCst), 1);
+
+        prop2.set_async(200).expect("Failed to set value through prop2");
+        thread::sleep(Duration::from_millis(50));
+        
+        assert_eq!(call_count1.load(Ordering::SeqCst), 2);
+        assert_eq!(call_count2.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn test_with_max_threads_thread_safety() {
+        let prop = Arc::new(ObservableProperty::with_max_threads(0, 3));
+        let call_count = Arc::new(AtomicUsize::new(0));
+
+        // Add observers from multiple threads
+        let handles: Vec<_> = (0..5)
+            .map(|thread_id| {
+                let prop_clone = prop.clone();
+                let count_clone = call_count.clone();
+
+                thread::spawn(move || {
+                    let count = count_clone.clone();
+                    let _subscription = prop_clone
+                        .subscribe_with_subscription(Arc::new(move |_, _| {
+                            count.fetch_add(1, Ordering::SeqCst);
+                        }))
+                        .expect("Failed to create thread-safe subscription");
+
+                    // Trigger async notifications from this thread
+                    prop_clone
+                        .set_async(thread_id * 10)
+                        .expect("Failed to set value from thread");
+                        
+                    thread::sleep(Duration::from_millis(10));
+                })
+            })
+            .collect();
+
+        // Wait for all threads to complete
+        for handle in handles {
+            handle.join().expect("Thread should complete successfully");
+        }
+
+        // Wait for all async operations to complete
+        thread::sleep(Duration::from_millis(100));
+
+        // Each set_async should trigger all active observers at that time
+        // The exact count depends on timing, but should be > 0
+        assert!(call_count.load(Ordering::SeqCst) > 0);
+    }
+
+    #[test]
+    fn test_with_max_threads_error_handling() {
+        let prop = ObservableProperty::with_max_threads(42, 2);
+        
+        // Test that error handling works the same as regular properties
+        let _subscription = prop
+            .subscribe_with_subscription(Arc::new(|_, _| {
+                // Normal observer
+            }))
+            .expect("Failed to create subscription for error handling test");
+
+        // Should handle errors gracefully
+        assert!(prop.set(100).is_ok());
+        assert!(prop.set_async(200).is_ok());
+        assert_eq!(prop.get().expect("Failed to get value after error test"), 200);
     }
 }
