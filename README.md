@@ -1,4 +1,16 @@
-# Observable Property
+# Ob## Features
+
+* **Thread-safe**: Uses `Arc<RwLock<>>` for safe concurrent access
+* **Observer pattern**: Subscribe to property changes with callbacks
+* **RAII subscriptions**: Automatic cleanup with subscription guards (no manual unsubscribe needed)
+* **Filtered observers**: Only notify when specific conditions are met
+* **Async notifications**: Non-blocking observer notifications with background threads
+* **Configurable threading**: Customize thread pool size for async notifications via `with_max_threads()`
+* **Panic isolation**: Observer panics don't crash the system
+* **Robust error handling**: Comprehensive error handling with descriptive error messages
+* **Production-ready**: No `unwrap()` calls - all errors are handled gracefully
+* **Type-safe**: Generic implementation works with any `Clone + Send + Sync + 'static' type
+* **Zero dependencies**: Uses only Rust standard libraryperty
 
 A thread-safe observable property implementation for Rust that allows you to observe changes to values across multiple threads. Built with comprehensive error handling and no `unwrap()` calls for maximum reliability.
 
@@ -21,7 +33,7 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-observable-property = "0.3.0"
+observable-property = "0.3.2"
 ```
 
 ## Usage
@@ -244,6 +256,36 @@ fn main() -> Result<(), observable_property::PropertyError> {
 }
 ```
 
+### Configurable Threading
+
+Customize the thread pool size for async notifications based on your system requirements:
+
+```rust
+use observable_property::ObservableProperty;
+use std::sync::Arc;
+
+fn main() -> Result<(), observable_property::PropertyError> {
+    // For high-throughput systems (more CPU cores)
+    let high_perf_property = ObservableProperty::with_max_threads(0, 8);
+    
+    // For resource-constrained systems (embedded/mobile)
+    let low_resource_property = ObservableProperty::with_max_threads(42, 1);
+    
+    // For I/O-heavy observers (network/database operations)
+    let io_heavy_property = ObservableProperty::with_max_threads("data".to_string(), 16);
+
+    // Use like any other property
+    let _subscription = high_perf_property.subscribe_with_subscription(Arc::new(|old, new| {
+        println!("High performance: {} -> {}", old, new);
+    }))?;
+
+    // Async notifications will use the configured thread pool
+    high_perf_property.set_async(100)?;
+    
+    Ok(())
+}
+```
+
 ## Error Handling
 
 The library uses a comprehensive error system for robust, production-ready error handling. **All operations are designed to fail gracefully** with meaningful error messages - there are no `unwrap()` calls that can cause unexpected panics.
@@ -444,17 +486,26 @@ let _subscription = property.subscribe_with_subscription(Arc::new(|old, new| {
 
 ## Recent Improvements
 
+### v0.3.2 - Configurable Threading & Enhanced Documentation
+
+- ⚙️ **Configurable thread pools**: New `with_max_threads()` constructor allows custom thread limits for async notifications
+- 📖 **Comprehensive documentation**: Complete API documentation with examples, use cases, and performance guidance
+- 🧪 **Expanded test coverage**: 49+ unit tests and 30+ documentation tests (79 total tests)
+- 🎯 **Performance tuning**: Fine-tune async notification performance for different system requirements
+- 🔧 **Better async control**: Optimize for CPU-bound, I/O-bound, or resource-constrained environments
+- 📚 **Rich examples**: Detailed code examples for high-throughput, embedded, and network-heavy scenarios
+
 ### v0.2.1 - Enhanced Error Handling & Production Readiness
 
 - 🔧 **Eliminated all `unwrap()` calls**: Replaced with proper error handling using `expect()` with descriptive messages
 - 🛡️ **Enhanced robustness**: All error conditions now provide clear, actionable error messages
-- 🧪 **Improved testing**: 40+ unit tests and 26+ documentation tests ensure reliability
+- 🧪 **Improved testing**: Comprehensive test suite ensures reliability
 - 🔒 **Better poisoned lock handling**: Graceful degradation when locks are poisoned by panics
 - 📈 **Production ready**: Suitable for production environments with comprehensive error handling
 - 🚀 **Performance**: No runtime performance impact from improved error handling
 - 📚 **Better debugging**: Clear error context helps identify issues quickly
 
-The library now follows Rust best practices for error handling, making it more reliable and easier to debug in production environments.
+The library now provides both robust error handling and configurable performance tuning, making it suitable for a wide range of production environments from embedded systems to high-throughput servers.
 
 ## Contributing
 
