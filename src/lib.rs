@@ -1546,7 +1546,7 @@ mod tests {
         // Create a thread that will deliberately poison the lock
         let poison_thread = thread::spawn(move || {
             // Get write lock and then panic, which will poison the lock
-            let _guard = prop_clone.inner.write().unwrap();
+            let _guard = prop_clone.inner.write().expect("Failed to acquire write lock for poisoning test");
             panic!("Deliberate panic to poison the lock");
         });
 
@@ -1589,7 +1589,7 @@ mod tests {
             .subscribe(Arc::new(|_, _| {
                 panic!("This observer deliberately panics");
             }))
-            .unwrap();
+            .expect("Failed to subscribe panic observer");
 
         // Second observer should still be called despite first one panicking
         let counts = call_counts.clone();
@@ -1597,17 +1597,17 @@ mod tests {
             .subscribe(Arc::new(move |_, _| {
                 counts.fetch_add(1, Ordering::SeqCst);
             }))
-            .unwrap();
+            .expect("Failed to subscribe normal observer");
 
         // Trigger the observers - this shouldn't panic despite the first observer panicking
-        prop.set(42).unwrap();
+        prop.set(42).expect("Failed to set property value");
 
         // Verify the second observer was still called
         assert_eq!(call_counts.load(Ordering::SeqCst), 1);
 
         // Clean up
-        prop.unsubscribe(panic_observer_id).unwrap();
-        prop.unsubscribe(normal_observer_id).unwrap();
+        prop.unsubscribe(panic_observer_id).expect("Failed to unsubscribe panic observer");
+        prop.unsubscribe(normal_observer_id).expect("Failed to unsubscribe normal observer");
     }
 
     #[test]
@@ -1615,7 +1615,7 @@ mod tests {
         let property = ObservableProperty::new(0);
 
         // Generate a valid observer ID
-        let valid_id = property.subscribe(Arc::new(|_, _| {})).unwrap();
+        let valid_id = property.subscribe(Arc::new(|_, _| {})).expect("Failed to subscribe test observer");
 
         // Create an ID that doesn't exist (valid_id + 1000 should not exist)
         let nonexistent_id = valid_id + 1000;
@@ -1632,9 +1632,9 @@ mod tests {
         }
 
         // Also verify that unsubscribing twice returns false the second time
-        property.unsubscribe(valid_id).unwrap(); // First unsubscribe should return true
+        property.unsubscribe(valid_id).expect("Failed first unsubscribe"); // First unsubscribe should return true
 
-        let result = property.unsubscribe(valid_id).unwrap();
+        let result = property.unsubscribe(valid_id).expect("Failed second unsubscribe");
         assert!(!result, "Second unsubscribe should return false");
     }
 
@@ -1643,9 +1643,9 @@ mod tests {
         let prop = ObservableProperty::new(0);
 
         // Test that observer IDs increment properly and don't wrap around unexpectedly
-        let id1 = prop.subscribe(Arc::new(|_, _| {})).unwrap();
-        let id2 = prop.subscribe(Arc::new(|_, _| {})).unwrap();
-        let id3 = prop.subscribe(Arc::new(|_, _| {})).unwrap();
+        let id1 = prop.subscribe(Arc::new(|_, _| {})).expect("Failed to subscribe observer 1");
+        let id2 = prop.subscribe(Arc::new(|_, _| {})).expect("Failed to subscribe observer 2");
+        let id3 = prop.subscribe(Arc::new(|_, _| {})).expect("Failed to subscribe observer 3");
 
         assert!(id2 > id1, "Observer IDs should increment");
         assert!(id3 > id2, "Observer IDs should continue incrementing");
@@ -1653,9 +1653,9 @@ mod tests {
         assert_eq!(id3, id2 + 1, "Observer IDs should increment by 1");
 
         // Clean up
-        prop.unsubscribe(id1).unwrap();
-        prop.unsubscribe(id2).unwrap();
-        prop.unsubscribe(id3).unwrap();
+        prop.unsubscribe(id1).expect("Failed to unsubscribe observer 1");
+        prop.unsubscribe(id2).expect("Failed to unsubscribe observer 2");
+        prop.unsubscribe(id3).expect("Failed to unsubscribe observer 3");
     }
 
     #[test]
@@ -1721,13 +1721,13 @@ mod tests {
             .subscribe(Arc::new(|_, _| {
                 panic!("First panic observer");
             }))
-            .unwrap();
+            .expect("Failed to subscribe first panic observer");
 
         let _panic_id2 = prop
             .subscribe(Arc::new(|_, _| {
                 panic!("Second panic observer");
             }))
-            .unwrap();
+            .expect("Failed to subscribe second panic observer");
 
         // Create observers that should succeed despite the panics
         let count1 = successful_calls.clone();
@@ -1735,17 +1735,17 @@ mod tests {
             .subscribe(Arc::new(move |_, _| {
                 count1.fetch_add(1, Ordering::SeqCst);
             }))
-            .unwrap();
+            .expect("Failed to subscribe first success observer");
 
         let count2 = successful_calls.clone();
         let _success_id2 = prop
             .subscribe(Arc::new(move |_, _| {
                 count2.fetch_add(1, Ordering::SeqCst);
             }))
-            .unwrap();
+            .expect("Failed to subscribe second success observer");
 
         // Trigger all observers
-        prop.set(42).unwrap();
+        prop.set(42).expect("Failed to set property value for panic isolation test");
 
         // Both successful observers should have been called despite the panics
         assert_eq!(successful_calls.load(Ordering::SeqCst), 2);
@@ -1761,7 +1761,7 @@ mod tests {
             .subscribe(Arc::new(|_, _| {
                 panic!("Async panic observer");
             }))
-            .unwrap();
+            .expect("Failed to subscribe async panic observer");
 
         // Create observer that should succeed
         let count = successful_calls.clone();
@@ -1769,10 +1769,10 @@ mod tests {
             .subscribe(Arc::new(move |_, _| {
                 count.fetch_add(1, Ordering::SeqCst);
             }))
-            .unwrap();
+            .expect("Failed to subscribe async success observer");
 
         // Use async set to trigger observers in background threads
-        prop.set_async(42).unwrap();
+        prop.set_async(42).expect("Failed to set property value asynchronously");
 
         // Wait for async observers to complete
         thread::sleep(Duration::from_millis(100));
@@ -1798,19 +1798,19 @@ mod tests {
                     assert_eq!(*old, 0);
                     assert_eq!(*new, i + 1);
                 }))
-                .unwrap();
+                .expect("Failed to subscribe large observer count test observer");
             observer_ids.push(id);
         }
 
         // Trigger all observers
-        prop.set(observer_count).unwrap();
+        prop.set(observer_count).expect("Failed to set property value for large observer count test");
 
         // All observers should have been called
         assert_eq!(total_calls.load(Ordering::SeqCst), observer_count);
 
         // Clean up
         for id in observer_ids {
-            prop.unsubscribe(id).unwrap();
+            prop.unsubscribe(id).expect("Failed to unsubscribe observer in large count test");
         }
     }
 
@@ -1826,21 +1826,21 @@ mod tests {
                     hist.push((*old, *new));
                 }
             }))
-            .unwrap();
+            .expect("Failed to subscribe mutable state observer");
 
         // Make several changes
-        prop.set(1).unwrap();
-        prop.set(2).unwrap();
-        prop.set(3).unwrap();
+        prop.set(1).expect("Failed to set property to 1");
+        prop.set(2).expect("Failed to set property to 2");
+        prop.set(3).expect("Failed to set property to 3");
 
         // Verify the history was recorded correctly
-        let history = call_history.read().unwrap();
+        let history = call_history.read().expect("Failed to read call history");
         assert_eq!(history.len(), 3);
         assert_eq!(history[0], (0, 1));
         assert_eq!(history[1], (1, 2));
         assert_eq!(history[2], (2, 3));
 
-        prop.unsubscribe(observer_id).unwrap();
+        prop.unsubscribe(observer_id).expect("Failed to unsubscribe mutable state observer");
     }
 
     #[test]
@@ -1855,17 +1855,17 @@ mod tests {
                 .subscribe_with_subscription(Arc::new(move |_, _| {
                     count.fetch_add(1, Ordering::SeqCst);
                 }))
-                .unwrap();
+                .expect("Failed to create subscription for automatic cleanup test");
 
             // Observer should be active while subscription is in scope
-            prop.set(1).unwrap();
+            prop.set(1).expect("Failed to set property value in subscription test");
             assert_eq!(call_count.load(Ordering::SeqCst), 1);
 
             // Subscription goes out of scope here and should auto-cleanup
         }
 
         // Observer should no longer be active after subscription dropped
-        prop.set(2).unwrap();
+        prop.set(2).expect("Failed to set property value after subscription dropped");
         assert_eq!(call_count.load(Ordering::SeqCst), 1); // No additional calls
     }
 
@@ -1879,17 +1879,17 @@ mod tests {
             .subscribe_with_subscription(Arc::new(move |_, _| {
                 count.fetch_add(1, Ordering::SeqCst);
             }))
-            .unwrap();
+            .expect("Failed to create subscription for explicit drop test");
 
         // Observer should be active
-        prop.set(1).unwrap();
+        prop.set(1).expect("Failed to set property value before explicit drop");
         assert_eq!(call_count.load(Ordering::SeqCst), 1);
 
         // Explicitly drop the subscription
         drop(subscription);
 
         // Observer should no longer be active
-        prop.set(2).unwrap();
+        prop.set(2).expect("Failed to set property value after explicit drop");
         assert_eq!(call_count.load(Ordering::SeqCst), 1);
     }
 
@@ -1908,22 +1908,22 @@ mod tests {
             .subscribe_with_subscription(Arc::new(move |_, _| {
                 count1.fetch_add(1, Ordering::SeqCst);
             }))
-            .unwrap();
+            .expect("Failed to create first subscription");
 
         let subscription2 = prop
             .subscribe_with_subscription(Arc::new(move |_, _| {
                 count2.fetch_add(1, Ordering::SeqCst);
             }))
-            .unwrap();
+            .expect("Failed to create second subscription");
 
         let subscription3 = prop
             .subscribe_with_subscription(Arc::new(move |_, _| {
                 count3.fetch_add(1, Ordering::SeqCst);
             }))
-            .unwrap();
+            .expect("Failed to create third subscription");
 
         // All observers should be active
-        prop.set(1).unwrap();
+        prop.set(1).expect("Failed to set property value with all subscriptions");
         assert_eq!(call_count1.load(Ordering::SeqCst), 1);
         assert_eq!(call_count2.load(Ordering::SeqCst), 1);
         assert_eq!(call_count3.load(Ordering::SeqCst), 1);
@@ -1932,7 +1932,7 @@ mod tests {
         drop(subscription2);
 
         // Only first and third should be active
-        prop.set(2).unwrap();
+        prop.set(2).expect("Failed to set property value with partial subscriptions");
         assert_eq!(call_count1.load(Ordering::SeqCst), 2);
         assert_eq!(call_count2.load(Ordering::SeqCst), 1); // No change
         assert_eq!(call_count3.load(Ordering::SeqCst), 2);
@@ -1942,7 +1942,7 @@ mod tests {
         drop(subscription3);
 
         // No observers should be active
-        prop.set(3).unwrap();
+        prop.set(3).expect("Failed to set property value with no subscriptions");
         assert_eq!(call_count1.load(Ordering::SeqCst), 2);
         assert_eq!(call_count2.load(Ordering::SeqCst), 1);
         assert_eq!(call_count3.load(Ordering::SeqCst), 2);
@@ -1960,11 +1960,11 @@ mod tests {
             .subscribe_with_subscription(Arc::new(move |_, _| {
                 count.fetch_add(1, Ordering::SeqCst);
             }))
-            .unwrap();
+            .expect("Failed to create subscription for poisoned lock test");
 
         // Poison the lock by panicking while holding a write lock
         let poison_thread = thread::spawn(move || {
-            let _guard = prop_clone.inner.write().unwrap();
+            let _guard = prop_clone.inner.write().expect("Failed to acquire write lock for poisoning test");
             panic!("Deliberate panic to poison the lock");
         });
         let _ = poison_thread.join(); // Ignore the panic result
@@ -1988,7 +1988,7 @@ mod tests {
             .subscribe(Arc::new(move |_, _| {
                 manual_count_clone.fetch_add(1, Ordering::SeqCst);
             }))
-            .unwrap();
+            .expect("Failed to create manual subscription");
 
         // Automatic subscription
         let auto_count_clone = auto_count.clone();
@@ -1996,18 +1996,18 @@ mod tests {
             .subscribe_with_subscription(Arc::new(move |_, _| {
                 auto_count_clone.fetch_add(1, Ordering::SeqCst);
             }))
-            .unwrap();
+            .expect("Failed to create automatic subscription");
 
         // Both should be active
-        prop.set(1).unwrap();
+        prop.set(1).expect("Failed to set property value with both subscriptions");
         assert_eq!(manual_count.load(Ordering::SeqCst), 1);
         assert_eq!(auto_count.load(Ordering::SeqCst), 1);
 
         // Manual unsubscribe
-        prop.unsubscribe(manual_id).unwrap();
+        prop.unsubscribe(manual_id).expect("Failed to manually unsubscribe");
 
         // Only automatic subscription should be active
-        prop.set(2).unwrap();
+        prop.set(2).expect("Failed to set property value after manual unsubscribe");
         assert_eq!(manual_count.load(Ordering::SeqCst), 1); // No change
         assert_eq!(auto_count.load(Ordering::SeqCst), 2);
 
@@ -2021,7 +2021,7 @@ mod tests {
 
         // Poison the lock
         let poison_thread = thread::spawn(move || {
-            let _guard = prop_clone.inner.write().unwrap();
+            let _guard = prop_clone.inner.write().expect("Failed to acquire write lock for poisoning test");
             panic!("Deliberate panic to poison the lock");
         });
         let _ = poison_thread.join();
@@ -2029,7 +2029,7 @@ mod tests {
         // subscribe_with_subscription should return an error for poisoned lock
         let result = prop.subscribe_with_subscription(Arc::new(|_, _| {}));
         assert!(result.is_err());
-        match result.unwrap_err() {
+        match result.expect_err("Expected error for poisoned lock") {
             PropertyError::WriteLockError { .. } | PropertyError::PoisonedLock => {
                 // Either error type is acceptable for poisoned lock
             }
@@ -2049,14 +2049,14 @@ mod tests {
             .subscribe_with_subscription(Arc::new(move |_, _| {
                 count.fetch_add(1, Ordering::SeqCst);
             }))
-            .unwrap();
+            .expect("Failed to create subscription for cloned property test");
 
         // Changes through prop2 should trigger the observer subscribed to prop1
-        prop2.set(42).unwrap();
+        prop2.set(42).expect("Failed to set property value through prop2");
         assert_eq!(call_count.load(Ordering::SeqCst), 1);
 
         // Changes through prop1 should also trigger the observer
-        prop1.set(100).unwrap();
+        prop1.set(100).expect("Failed to set property value through prop1");
         assert_eq!(call_count.load(Ordering::SeqCst), 2);
     }
 
@@ -2073,17 +2073,17 @@ mod tests {
                 .subscribe_with_subscription(Arc::new(move |_, _| {
                     count.fetch_add(1, Ordering::SeqCst);
                 }))
-                .unwrap();
+                .expect("Failed to create subscription in conditional block");
 
             // Observer active within this block
-            prop.set(1).unwrap();
+            prop.set(1).expect("Failed to set property value in conditional block");
             assert_eq!(call_count.load(Ordering::SeqCst), 1);
 
             // Subscription dropped when exiting this block
         }
 
         // Observer should be inactive now
-        prop.set(2).unwrap();
+        prop.set(2).expect("Failed to set property value after conditional block");
         assert_eq!(call_count.load(Ordering::SeqCst), 1);
     }
 
@@ -2117,16 +2117,16 @@ mod tests {
         let prop = ObservableProperty::new(0);
 
         // Test early return
-        test_function(&prop, true).unwrap();
+        test_function(&prop, true).expect("Failed to test early return");
 
         // Verify observer is no longer active after early return
-        prop.set(10).unwrap();
+        prop.set(10).expect("Failed to set property value after early return");
 
         // Test normal exit
-        test_function(&prop, false).unwrap();
+        test_function(&prop, false).expect("Failed to test normal exit");
 
         // Verify observer is no longer active after normal exit
-        prop.set(20).unwrap();
+        prop.set(20).expect("Failed to set property value after normal exit");
     }
 
     #[test]
@@ -2139,24 +2139,24 @@ mod tests {
             .subscribe_with_subscription(Arc::new(move |_, _| {
                 count.fetch_add(1, Ordering::SeqCst);
             }))
-            .unwrap();
+            .expect("Failed to create subscription for move semantics test");
 
         // Observer should be active
-        prop.set(1).unwrap();
+        prop.set(1).expect("Failed to set property value before move");
         assert_eq!(call_count.load(Ordering::SeqCst), 1);
 
         // Move subscription to a new variable
         let moved_subscription = subscription;
 
         // Observer should still be active after move
-        prop.set(2).unwrap();
+        prop.set(2).expect("Failed to set property value after move");
         assert_eq!(call_count.load(Ordering::SeqCst), 2);
 
         // Drop the moved subscription
         drop(moved_subscription);
 
         // Observer should now be inactive
-        prop.set(3).unwrap();
+        prop.set(3).expect("Failed to set property value after moved subscription drop");
         assert_eq!(call_count.load(Ordering::SeqCst), 2);
     }
 
@@ -2174,25 +2174,25 @@ mod tests {
                     }),
                     |old, new| new > old, // Only trigger on increases
                 )
-                .unwrap();
+                .expect("Failed to create filtered subscription");
 
             // Should trigger (0 -> 5)
-            prop.set(5).unwrap();
+            prop.set(5).expect("Failed to set property value to 5 in filtered test");
             assert_eq!(call_count.load(Ordering::SeqCst), 1);
 
             // Should NOT trigger (5 -> 3)
-            prop.set(3).unwrap();
+            prop.set(3).expect("Failed to set property value to 3 in filtered test");
             assert_eq!(call_count.load(Ordering::SeqCst), 1);
 
             // Should trigger (3 -> 10)
-            prop.set(10).unwrap();
+            prop.set(10).expect("Failed to set property value to 10 in filtered test");
             assert_eq!(call_count.load(Ordering::SeqCst), 2);
 
             // Subscription goes out of scope here
         }
 
         // Observer should be inactive after subscription cleanup
-        prop.set(20).unwrap();
+        prop.set(20).expect("Failed to set property value after filtered subscription cleanup");
         assert_eq!(call_count.load(Ordering::SeqCst), 2);
     }
 
@@ -2214,7 +2214,7 @@ mod tests {
                 }),
                 |old, new| new > old,
             )
-            .unwrap();
+            .expect("Failed to create increase subscription");
 
         let _decrease_sub = prop
             .subscribe_filtered_with_subscription(
@@ -2223,7 +2223,7 @@ mod tests {
                 }),
                 |old, new| new < old,
             )
-            .unwrap();
+            .expect("Failed to create decrease subscription");
 
         let _significant_sub = prop
             .subscribe_filtered_with_subscription(
@@ -2232,28 +2232,28 @@ mod tests {
                 }),
                 |old, new| ((*new as i32) - (*old as i32)).abs() > 5,
             )
-            .unwrap();
+            .expect("Failed to create significant change subscription");
 
         // Test increases
-        prop.set(15).unwrap(); // +5: triggers increase, not significant
+        prop.set(15).expect("Failed to set property to 15 in multiple filtered test"); // +5: triggers increase, not significant
         assert_eq!(increase_count.load(Ordering::SeqCst), 1);
         assert_eq!(decrease_count.load(Ordering::SeqCst), 0);
         assert_eq!(significant_change_count.load(Ordering::SeqCst), 0);
 
         // Test significant increase
-        prop.set(25).unwrap(); // +10: triggers increase and significant
+        prop.set(25).expect("Failed to set property to 25 in multiple filtered test"); // +10: triggers increase and significant
         assert_eq!(increase_count.load(Ordering::SeqCst), 2);
         assert_eq!(decrease_count.load(Ordering::SeqCst), 0);
         assert_eq!(significant_change_count.load(Ordering::SeqCst), 1);
 
         // Test significant decrease
-        prop.set(5).unwrap(); // -20: triggers decrease and significant
+        prop.set(5).expect("Failed to set property to 5 in multiple filtered test"); // -20: triggers decrease and significant
         assert_eq!(increase_count.load(Ordering::SeqCst), 2);
         assert_eq!(decrease_count.load(Ordering::SeqCst), 1);
         assert_eq!(significant_change_count.load(Ordering::SeqCst), 2);
 
         // Test small decrease
-        prop.set(3).unwrap(); // -2: triggers decrease, not significant
+        prop.set(3).expect("Failed to set property to 3 in multiple filtered test"); // -2: triggers decrease, not significant
         assert_eq!(increase_count.load(Ordering::SeqCst), 2);
         assert_eq!(decrease_count.load(Ordering::SeqCst), 2);
         assert_eq!(significant_change_count.load(Ordering::SeqCst), 2);
@@ -2285,28 +2285,28 @@ mod tests {
                     old_int != new_int && (new - old).abs() > 0.5_f64
                 },
             )
-            .unwrap();
+            .expect("Failed to create complex filtered subscription");
 
         // Small changes within same integer - should not trigger
-        prop.set(0.3).unwrap();
-        prop.set(0.7).unwrap();
+        prop.set(0.3).expect("Failed to set property to 0.3 in complex filter test");
+        prop.set(0.7).expect("Failed to set property to 0.7 in complex filter test");
         assert_eq!(call_count.load(Ordering::SeqCst), 0);
 
         // Cross integer boundary with significant change - should trigger
-        prop.set(1.3).unwrap(); // Change of 0.6, which is > 0.5
+        prop.set(1.3).expect("Failed to set property to 1.3 in complex filter test"); // Change of 0.6, which is > 0.5
         assert_eq!(call_count.load(Ordering::SeqCst), 1);
 
         // Small cross-boundary change - should not trigger
-        prop.set(1.9).unwrap();
-        prop.set(2.1).unwrap(); // Change of 0.2, less than 0.5
+        prop.set(1.9).expect("Failed to set property to 1.9 in complex filter test");
+        prop.set(2.1).expect("Failed to set property to 2.1 in complex filter test"); // Change of 0.2, less than 0.5
         assert_eq!(call_count.load(Ordering::SeqCst), 1);
 
         // Large cross-boundary change - should trigger
-        prop.set(3.5).unwrap();
+        prop.set(3.5).expect("Failed to set property to 3.5 in complex filter test");
         assert_eq!(call_count.load(Ordering::SeqCst), 2);
 
         // Verify received values
-        let values = values_received.read().unwrap();
+        let values = values_received.read().expect("Failed to read values in complex filter test");
         assert_eq!(values.len(), 2);
         assert_eq!(values[0], (0.7, 1.3));
         assert_eq!(values[1], (2.1, 3.5));
@@ -2319,7 +2319,7 @@ mod tests {
 
         // Poison the lock
         let poison_thread = thread::spawn(move || {
-            let _guard = prop_clone.inner.write().unwrap();
+            let _guard = prop_clone.inner.write().expect("Failed to acquire write lock for filtered subscription poison test");
             panic!("Deliberate panic to poison the lock");
         });
         let _ = poison_thread.join();
@@ -2344,7 +2344,7 @@ mod tests {
                 }),
                 |old, new| new > old,
             )
-            .unwrap();
+            .expect("Failed to create manual filtered subscription");
 
         // Automatic filtered subscription
         let auto_count_clone = auto_count.clone();
@@ -2355,28 +2355,28 @@ mod tests {
                 }),
                 |old, new| new > old,
             )
-            .unwrap();
+            .expect("Failed to create automatic filtered subscription");
 
         // Both should be triggered by increases
-        prop.set(5).unwrap();
+        prop.set(5).expect("Failed to set property to 5 in filtered vs manual test");
         assert_eq!(manual_count.load(Ordering::SeqCst), 1);
         assert_eq!(auto_count.load(Ordering::SeqCst), 1);
 
         // Neither should be triggered by decreases
-        prop.set(3).unwrap();
+        prop.set(3).expect("Failed to set property to 3 in filtered vs manual test");
         assert_eq!(manual_count.load(Ordering::SeqCst), 1);
         assert_eq!(auto_count.load(Ordering::SeqCst), 1);
 
         // Both should be triggered by increases again
-        prop.set(10).unwrap();
+        prop.set(10).expect("Failed to set property to 10 in filtered vs manual test");
         assert_eq!(manual_count.load(Ordering::SeqCst), 2);
         assert_eq!(auto_count.load(Ordering::SeqCst), 2);
 
         // Manual cleanup
-        prop.unsubscribe(manual_id).unwrap();
+        prop.unsubscribe(manual_id).expect("Failed to unsubscribe manual filtered observer");
 
         // Only automatic subscription should be active
-        prop.set(15).unwrap();
+        prop.set(15).expect("Failed to set property to 15 after manual cleanup");
         assert_eq!(manual_count.load(Ordering::SeqCst), 2); // No change
         assert_eq!(auto_count.load(Ordering::SeqCst), 3);
 
@@ -2401,19 +2401,19 @@ mod tests {
                     true // Accept all other values
                 },
             )
-            .unwrap();
+            .expect("Failed to create panicking filter subscription");
 
         // Normal value should work
-        prop.set(1).unwrap();
+        prop.set(1).expect("Failed to set property to 1 in panicking filter test");
         assert_eq!(call_count.load(Ordering::SeqCst), 1);
 
         // Value that causes filter to panic should be handled gracefully
         // The behavior here depends on how the filter panic is handled
         // In the current implementation, filter panics may cause the observer to not be called
-        prop.set(42).unwrap();
+        prop.set(42).expect("Failed to set property to 42 in panicking filter test");
 
         // Observer should still work for subsequent normal values
-        prop.set(2).unwrap();
+        prop.set(2).expect("Failed to set property to 2 after filter panic");
         // Note: The exact count here depends on panic handling implementation
         // The important thing is that the system doesn't crash
     }
@@ -2488,10 +2488,10 @@ mod tests {
             .subscribe_with_subscription(Arc::new(move |_, _| {
                 count.fetch_add(1, Ordering::SeqCst);
             }))
-            .unwrap();
+            .expect("Failed to create subscription for cross-thread drop test");
 
         // Verify observer is active
-        prop.set(1).unwrap();
+        prop.set(1).expect("Failed to set property value in cross-thread drop test");
         assert_eq!(call_count.load(Ordering::SeqCst), 1);
 
         // Move subscription to another thread and drop it there
@@ -2500,21 +2500,21 @@ mod tests {
 
         let handle = thread::spawn(move || {
             // Verify observer is still active in the other thread
-            prop_clone.set(2).unwrap();
+            prop_clone.set(2).expect("Failed to set property value in other thread");
             assert_eq!(call_count_clone.load(Ordering::SeqCst), 2);
 
             // Drop subscription in this thread
             drop(subscription);
 
             // Verify observer is no longer active
-            prop_clone.set(3).unwrap();
+            prop_clone.set(3).expect("Failed to set property value after drop in other thread");
             assert_eq!(call_count_clone.load(Ordering::SeqCst), 2); // No change
         });
 
-        handle.join().unwrap();
+        handle.join().expect("Failed to join cross-thread drop test thread");
 
         // Verify observer is still inactive in main thread
-        prop.set(4).unwrap();
+        prop.set(4).expect("Failed to set property value after thread join");
         assert_eq!(call_count.load(Ordering::SeqCst), 2);
     }
 
@@ -2669,7 +2669,7 @@ mod tests {
                 thread::sleep(Duration::from_millis(5));
                 println!("Sync observer: {} -> {}", old, new);
             }))
-            .unwrap();
+            .expect("Failed to create sync subscription");
 
         // Subscription that tracks async notifications
         let async_count = async_notifications.clone();
@@ -2678,18 +2678,18 @@ mod tests {
                 async_count.fetch_add(1, Ordering::SeqCst);
                 println!("Async observer: {} -> {}", old, new);
             }))
-            .unwrap();
+            .expect("Failed to create async subscription");
 
         // Test sync property changes
         let start = std::time::Instant::now();
-        prop.set(1).unwrap();
-        prop.set(2).unwrap();
+        prop.set(1).expect("Failed to set property value 1 in async test");
+        prop.set(2).expect("Failed to set property value 2 in async test");
         let sync_duration = start.elapsed();
 
         // Test async property changes
         let start = std::time::Instant::now();
-        prop.set_async(3).unwrap();
-        prop.set_async(4).unwrap();
+        prop.set_async(3).expect("Failed to set property value 3 async");
+        prop.set_async(4).expect("Failed to set property value 4 async");
         let async_duration = start.elapsed();
 
         // Async should be much faster
@@ -2717,11 +2717,11 @@ mod tests {
             .subscribe_with_subscription(Arc::new(move |_, _| {
                 count.fetch_add(1, Ordering::SeqCst);
             }))
-            .unwrap();
+            .expect("Failed to create subscription before poisoning");
 
         // Poison the lock
         let poison_thread = thread::spawn(move || {
-            let _guard = prop_clone.inner.write().unwrap();
+            let _guard = prop_clone.inner.write().expect("Failed to acquire write lock for subscription poison test");
             panic!("Deliberate panic to poison the lock");
         });
         let _ = poison_thread.join();
@@ -2751,16 +2751,16 @@ mod tests {
             .subscribe_with_subscription(Arc::new(move |_, _| {
                 count.fetch_add(1, Ordering::SeqCst);
             }))
-            .unwrap();
+            .expect("Failed to create subscription for cleanup behavior test");
 
         // Verify it works initially
-        prop.set(1).unwrap();
+        prop.set(1).expect("Failed to set property value in cleanup behavior test");
         assert_eq!(call_count.load(Ordering::SeqCst), 1);
 
         // Poison the lock from another thread
         let prop_clone = prop.clone();
         let poison_thread = thread::spawn(move || {
-            let _guard = prop_clone.inner.write().unwrap();
+            let _guard = prop_clone.inner.write().expect("Failed to acquire write lock for cleanup behavior poison test");
             panic!("Deliberate panic to poison the lock");
         });
         let _ = poison_thread.join();
@@ -2786,17 +2786,17 @@ mod tests {
                     count.fetch_add(1, Ordering::SeqCst);
                     println!("Observer {}: {} -> {}", i, old, new);
                 }))
-                .unwrap();
+                .expect("Failed to create subscription in multiple cleanup test");
             subscriptions.push(subscription);
         }
 
         // Verify they all work
-        prop.set(42).unwrap();
+        prop.set(42).expect("Failed to set property value in multiple cleanup test");
 
         // Poison the lock
         let prop_clone = prop.clone();
         let poison_thread = thread::spawn(move || {
-            let _guard = prop_clone.inner.write().unwrap();
+            let _guard = prop_clone.inner.write().expect("Failed to acquire write lock for multiple cleanup poison test");
             panic!("Deliberate panic to poison the lock");
         });
         let _ = poison_thread.join();
@@ -2821,16 +2821,16 @@ mod tests {
             .subscribe_with_subscription(Arc::new(move |_, _| {
                 before_count.fetch_add(1, Ordering::SeqCst);
             }))
-            .unwrap();
+            .expect("Failed to create subscription before poison test");
 
         // Verify it works
-        prop.set(1).unwrap();
+        prop.set(1).expect("Failed to set property value before poison test");
         assert_eq!(before_poison_count.load(Ordering::SeqCst), 1);
 
         // Poison the lock
         let prop_clone = prop.clone();
         let poison_thread = thread::spawn(move || {
-            let _guard = prop_clone.inner.write().unwrap();
+            let _guard = prop_clone.inner.write().expect("Failed to acquire write lock for before/after poison test");
             panic!("Deliberate panic to poison the lock");
         });
         let _ = poison_thread.join();
@@ -2864,14 +2864,14 @@ mod tests {
                     count.fetch_add(1, Ordering::SeqCst);
                     println!("Observer {}", i);
                 }))
-                .unwrap();
+                .expect("Failed to create subscription in concurrent drops test");
             subscriptions.push(subscription);
         }
 
         // Poison the lock
         let prop_clone = prop.clone();
         let poison_thread = thread::spawn(move || {
-            let _guard = prop_clone.inner.write().unwrap();
+            let _guard = prop_clone.inner.write().expect("Failed to acquire write lock for concurrent drops poison test");
             panic!("Deliberate panic to poison the lock");
         });
         let _ = poison_thread.join();
