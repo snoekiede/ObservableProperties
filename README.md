@@ -1,4 +1,6 @@
-# Ob## Features
+# Observable-Property 
+
+## Features
 
 * **Thread-safe**: Uses `Arc<RwLock<>>` for safe concurrent access
 * **Observer pattern**: Subscribe to property changes with callbacks
@@ -13,19 +15,6 @@
 * **Zero dependencies**: Uses only Rust standard libraryperty
 
 A thread-safe observable property implementation for Rust that allows you to observe changes to values across multiple threads. Built with comprehensive error handling and no `unwrap()` calls for maximum reliability.
-
-## Features
-
-* **Thread-safe**: Uses `Arc<RwLock<>>` for safe concurrent access
-* **Observer pattern**: Subscribe to property changes with callbacks
-* **RAII subscriptions**: Automatic cleanup with subscription guards (no manual unsubscribe needed)
-* **Filtered observers**: Only notify when specific conditions are met
-* **Async notifications**: Non-blocking observer notifications with background threads
-* **Panic isolation**: Observer panics don't crash the system
-* **Robust error handling**: Comprehensive error handling with descriptive error messages
-* **Production-ready**: No `unwrap()` calls - all errors are handled gracefully
-* **Type-safe**: Generic implementation works with any `Clone + Send + Sync + 'static` type
-* **Zero dependencies**: Uses only Rust standard library
 
 ## Quick Start
 
