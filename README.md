@@ -6,6 +6,7 @@ A thread-safe observable property implementation for Rust that allows you to obs
 
 * **Thread-safe**: Uses `Arc<RwLock<>>` for safe concurrent access
 * **Observer pattern**: Subscribe to property changes with callbacks
+* **RAII subscriptions**: Automatic cleanup with subscription guards (no manual unsubscribe needed)
 * **Filtered observers**: Only notify when specific conditions are met
 * **Async notifications**: Non-blocking observer notifications with background threads
 * **Panic isolation**: Observer panics don't crash the system
@@ -124,6 +125,89 @@ fn main() -> Result<(), observable_property::PropertyError> {
 }
 ```
 
+### RAII Subscriptions (Recommended)
+
+For automatic cleanup without manual unsubscribe calls, use RAII subscriptions:
+
+```rust
+use observable_property::ObservableProperty;
+use std::sync::Arc;
+
+fn main() -> Result<(), observable_property::PropertyError> {
+    let property = ObservableProperty::new(0);
+
+    {
+        // Create RAII subscription - automatically cleaned up when dropped
+        let _subscription = property.subscribe_with_subscription(Arc::new(|old, new| {
+            println!("Value changed: {} -> {}", old, new);
+        })).map_err(|e| {
+            eprintln!("Failed to create subscription: {}", e);
+            e
+        })?;
+
+        property.set(42).map_err(|e| {
+            eprintln!("Failed to set value: {}", e);
+            e
+        })?; // Prints: "Value changed: 0 -> 42"
+
+        // Subscription automatically unsubscribes when leaving this scope
+    }
+
+    // No observer active anymore
+    property.set(100).map_err(|e| {
+        eprintln!("Failed to set value: {}", e);
+        e
+    })?; // No output
+
+    Ok(())
+}
+```
+
+### Filtered RAII Subscriptions
+
+Combine filtering with automatic cleanup:
+
+```rust
+use observable_property::ObservableProperty;
+use std::sync::Arc;
+
+fn main() -> Result<(), observable_property::PropertyError> {
+    let temperature = ObservableProperty::new(20.0);
+
+    {
+        // Monitor temperature increases > 5 degrees with automatic cleanup
+        let _heat_warning = temperature.subscribe_filtered_with_subscription(
+            Arc::new(|old, new| {
+                println!("🔥 Heat warning! {:.1}°C -> {:.1}°C", old, new);
+            }),
+            |old, new| new > old && (new - old) > 5.0
+        ).map_err(|e| {
+            eprintln!("Failed to create heat warning subscription: {}", e);
+            e
+        })?;
+
+        temperature.set(22.0).map_err(|e| {
+            eprintln!("Failed to set temperature: {}", e);
+            e
+        })?; // No warning (only 2°C increase)
+        
+        temperature.set(28.0).map_err(|e| {
+            eprintln!("Failed to set temperature: {}", e);
+            e
+        })?; // Triggers warning (6°C increase)
+
+        // Subscription automatically cleaned up here
+    }
+
+    temperature.set(35.0).map_err(|e| {
+        eprintln!("Failed to set temperature: {}", e);
+        e
+    })?; // No warning (subscription was cleaned up)
+
+    Ok(())
+}
+```
+
 ### Async Notifications
 
 For observers that might perform time-consuming operations, use async notifications to avoid blocking:
@@ -136,12 +220,12 @@ use std::time::Duration;
 fn main() -> Result<(), observable_property::PropertyError> {
     let property = ObservableProperty::new(0);
 
-    property.subscribe(Arc::new(|old, new| {
+    let _subscription = property.subscribe_with_subscription(Arc::new(|old, new| {
         // This slow observer won't block the caller
         std::thread::sleep(Duration::from_millis(100));
         println!("Slow observer: {} -> {}", old, new);
     })).map_err(|e| {
-        eprintln!("Failed to subscribe: {}", e);
+        eprintln!("Failed to create subscription: {}", e);
         e
     })?;
 
@@ -192,11 +276,36 @@ fn example() -> Result<(), PropertyError> {
 }
 ```
 
+## Subscription Management
+
+The library provides two approaches for managing observer subscriptions:
+
+### Manual Management
+```rust
+let observer_id = property.subscribe(observer)?;
+// ... use the property
+property.unsubscribe(observer_id)?; // Manual cleanup required
+```
+
+### RAII Management (Recommended)
+```rust
+let _subscription = property.subscribe_with_subscription(observer)?;
+// ... use the property
+// Automatic cleanup when _subscription goes out of scope
+```
+
+**Benefits of RAII subscriptions:**
+- ✅ No manual cleanup required
+- ✅ Exception-safe (cleanup happens even if code panics)
+- ✅ Works across thread boundaries
+- ✅ Prevents observer leaks in complex control flow
+
 ## Performance Considerations
 
 - **Observers**: Each observer is called sequentially. For heavy computations, use `set_async()` to run observers in background threads.
 - **Lock contention**: The property uses a single `RwLock` internally. Consider having fewer, larger properties rather than many small ones.
-- **Memory**: Observer functions are stored as `Arc<dyn Fn>` and kept until unsubscribed.
+- **Memory**: Observer functions are stored as `Arc<dyn Fn>` and kept until unsubscribed or subscription is dropped.
+- **RAII overhead**: Subscription objects have minimal overhead (just an ID and Arc reference).
 
 ## Thread Safety
 
@@ -205,6 +314,97 @@ All operations are thread-safe:
 - Only one thread can modify the property at a time
 - Observer notifications happen outside the lock to minimize contention
 - Observer panics are isolated and don't affect other observers or the property
+- RAII subscriptions can be created and dropped from any thread
+- Poisoned locks are handled gracefully (subscriptions clean up without panicking)
+
+## Best Practices
+
+### Use RAII Subscriptions
+Prefer `subscribe_with_subscription()` and `subscribe_filtered_with_subscription()` over manual subscription management:
+
+```rust
+// ✅ Recommended: RAII subscription
+let _subscription = property.subscribe_with_subscription(observer)?;
+// Automatically cleaned up
+
+// ❌ Discouraged: Manual management (error-prone)
+let id = property.subscribe(observer)?;
+property.unsubscribe(id)?; // Easy to forget or miss in error paths
+```
+
+### Scoped Subscriptions
+Use block scoping for temporary subscriptions:
+
+```rust
+{
+    let _temp_subscription = property.subscribe_with_subscription(Arc::new(|old, new| {
+        println!("Temporary monitoring: {} -> {}", old, new);
+    }))?;
+    
+    // Do some work with monitoring active
+    property.set(42)?;
+    
+    // Subscription automatically ends here
+}
+// No more monitoring
+```
+
+### Lightweight Observers
+Keep observer functions lightweight for better performance:
+
+```rust
+// ✅ Good: Lightweight observer
+let _subscription = property.subscribe_with_subscription(Arc::new(|_, new| {
+    log::info!("Value updated to {}", new);
+}))?;
+
+// ❌ Avoid: Heavy computation in observer
+let _subscription = property.subscribe_with_subscription(Arc::new(|_, new| {
+    // This blocks all other observers!
+    expensive_computation(*new);
+}))?;
+
+// ✅ Better: Use async for heavy work
+property.set_async(new_value)?; // Non-blocking
+```
+
+### Error Handling
+Always handle potential errors:
+
+```rust
+match property.subscribe_with_subscription(observer) {
+    Ok(_subscription) => {
+        // Use subscription
+    }
+    Err(PropertyError::PoisonedLock) => {
+        // Handle poisoned lock scenario
+        eprintln!("Property is in invalid state");
+    }
+    Err(e) => {
+        eprintln!("Failed to create subscription: {}", e);
+    }
+}
+```
+
+## Migration from Manual to RAII Subscriptions
+
+If you're upgrading from manual subscription management:
+
+```rust
+// Before (manual management)
+let observer_id = property.subscribe(Arc::new(|old, new| {
+    println!("Value: {} -> {}", old, new);
+}))?;
+// ... do work
+property.unsubscribe(observer_id)?;
+
+// After (RAII management)  
+let _subscription = property.subscribe_with_subscription(Arc::new(|old, new| {
+    println!("Value: {} -> {}", old, new);
+}))?;
+// ... do work
+// Automatic cleanup!
+```
 
 ## Contributing
 
