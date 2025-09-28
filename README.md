@@ -22,7 +22,7 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-observable-property = "0.3.2"
+observable-property = "0.3.5"
 ```
 
 ## Usage
