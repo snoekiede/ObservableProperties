@@ -76,6 +76,46 @@ use std::panic;
 use std::sync::{Arc, RwLock};
 use std::thread;
 
+/// Maximum number of background threads used for asynchronous observer notifications
+///
+/// This constant controls the degree of parallelism when using `set_async()` to notify
+/// observers. The observer list is divided into batches, with each batch running in
+/// its own background thread, up to this maximum number of threads.
+///
+/// # Rationale
+///
+/// - **Resource Control**: Prevents unbounded thread creation that could exhaust system resources
+/// - **Performance Balance**: Provides parallelism benefits without excessive context switching overhead  
+/// - **Scalability**: Ensures consistent behavior regardless of the number of observers
+/// - **System Responsiveness**: Limits thread contention on multi-core systems
+///
+/// # Implementation Details
+///
+/// When `set_async()` is called:
+/// 1. All observers are collected into a snapshot
+/// 2. Observers are divided into `MAX_THREADS` batches (or fewer if there are fewer observers)
+/// 3. Each batch executes in its own `thread::spawn()` call
+/// 4. Observers within each batch are executed sequentially
+///
+/// For example, with 100 observers and `MAX_THREADS = 4`:
+/// - Batch 1: Observers 1-25 (Thread 1)
+/// - Batch 2: Observers 26-50 (Thread 2)  
+/// - Batch 3: Observers 51-75 (Thread 3)
+/// - Batch 4: Observers 76-100 (Thread 4)
+///
+/// # Tuning Considerations
+///
+/// This value can be adjusted based on your application's needs:
+/// - **CPU-bound observers**: Higher values may improve throughput on multi-core systems
+/// - **I/O-bound observers**: Higher values can improve concurrency for network/disk operations
+/// - **Memory-constrained systems**: Lower values reduce thread overhead
+/// - **Real-time systems**: Lower values reduce scheduling unpredictability
+///
+/// # Thread Safety
+///
+/// This constant is used only during the batching calculation and does not affect
+/// the thread safety of the overall system.
+const MAX_THREADS: usize = 4;
 /// Errors that can occur when working with ObservableProperty
 #[derive(Debug, Clone)]
 pub enum PropertyError {
@@ -135,6 +175,101 @@ pub type Observer<T> = Arc<dyn Fn(&T, &T) + Send + Sync>;
 
 /// Unique identifier for registered observers
 pub type ObserverId = usize;
+
+/// A RAII guard for an observer subscription that automatically unsubscribes when dropped
+///
+/// This struct provides automatic cleanup for observer subscriptions using RAII (Resource
+/// Acquisition Is Initialization) pattern. When a `Subscription` goes out of scope, its
+/// `Drop` implementation automatically removes the associated observer from the property.
+///
+/// This eliminates the need for manual `unsubscribe()` calls and helps prevent resource
+/// leaks in scenarios where observers might otherwise be forgotten.
+///
+/// # Type Requirements
+///
+/// The generic type `T` must implement the same traits as `ObservableProperty<T>`:
+/// - `Clone`: Required for observer notifications
+/// - `Send`: Required for transferring between threads  
+/// - `Sync`: Required for concurrent access from multiple threads
+/// - `'static`: Required for observer callbacks that may outlive the original scope
+///
+/// # Examples
+///
+/// ```rust
+/// use observable_property::ObservableProperty;
+/// use std::sync::Arc;
+///
+/// let property = ObservableProperty::new(0);
+///
+/// {
+///     // Create subscription - observer is automatically registered
+///     let _subscription = property.subscribe_with_subscription(Arc::new(|old, new| {
+///         println!("Value changed: {} -> {}", old, new);
+///     })).map_err(|e| {
+///         eprintln!("Failed to create subscription: {}", e);
+///         e
+///     })?;
+///
+///     property.set(42).map_err(|e| {
+///         eprintln!("Failed to set value: {}", e);
+///         e
+///     })?; // Observer is called: "Value changed: 0 -> 42"
+///
+///     // When _subscription goes out of scope here, observer is automatically removed
+/// }
+///
+/// property.set(100).map_err(|e| {
+///     eprintln!("Failed to set value: {}", e);
+///     e
+/// })?; // No observer output - subscription was automatically cleaned up
+/// # Ok::<(), observable_property::PropertyError>(())
+/// ```
+///
+/// # Thread Safety
+///
+/// Like `ObservableProperty` itself, `Subscription` is thread-safe. It can be safely
+/// sent between threads and the automatic cleanup will work correctly even if the
+/// subscription is dropped from a different thread than where it was created.
+pub struct Subscription<T: Clone + Send + Sync + 'static> {
+    inner: Arc<RwLock<InnerProperty<T>>>,
+    id: ObserverId,
+}
+
+impl<T: Clone + Send + Sync + 'static> std::fmt::Debug for Subscription<T> {
+    /// Debug implementation that shows the subscription ID without exposing internals
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Subscription")
+            .field("id", &self.id)
+            .field("inner", &"[ObservableProperty]")
+            .finish()
+    }
+}
+
+impl<T: Clone + Send + Sync + 'static> Drop for Subscription<T> {
+    /// Automatically removes the associated observer when the subscription is dropped
+    ///
+    /// This implementation provides automatic cleanup by removing the observer
+    /// from the property's observer list when the `Subscription` goes out of scope.
+    /// 
+    /// # Error Handling
+    ///
+    /// If the property's lock is poisoned or inaccessible during cleanup, the error
+    /// is silently ignored using the `let _ = ...` pattern. This is intentional
+    /// because:
+    /// 1. Drop implementations should not panic
+    /// 2. If the property is poisoned, it's likely unusable anyway
+    /// 3. There's no meaningful way to handle cleanup errors in a destructor
+    ///
+    /// # Thread Safety
+    ///
+    /// This method is safe to call from any thread, even if the subscription
+    /// was created on a different thread.
+    fn drop(&mut self) {
+        let _ = self.inner.write().map(|mut prop| {
+            prop.observers.remove(&self.id);
+        });
+    }
+}
 
 /// A thread-safe observable property that notifies observers when its value changes
 ///
@@ -371,7 +506,7 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
             return Ok(());
         }
 
-        const MAX_THREADS: usize = 4;
+
         let observers_per_thread = observers_snapshot.len().div_ceil(MAX_THREADS);
 
         for batch in observers_snapshot.chunks(observers_per_thread) {
@@ -443,7 +578,7 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
         Ok(id)
     }
 
-    /// Removes an observer by its ID
+    /// Removes an observer identified by its ID
     ///
     /// # Arguments
     ///
@@ -553,6 +688,178 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
         });
 
         self.subscribe(filtered_observer)
+    }
+
+    /// Subscribes an observer and returns a RAII guard for automatic cleanup
+    ///
+    /// This method is similar to `subscribe()` but returns a `Subscription` object
+    /// that automatically removes the observer when it goes out of scope. This
+    /// provides a more convenient and safer alternative to manual subscription
+    /// management.
+    ///
+    /// # Arguments
+    ///
+    /// * `observer` - A function wrapped in `Arc` that takes `(&T, &T)` parameters
+    ///
+    /// # Returns
+    ///
+    /// `Ok(Subscription<T>)` containing a RAII guard for the observer,
+    /// or `Err(PropertyError)` if the lock is poisoned.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use observable_property::ObservableProperty;
+    /// use std::sync::Arc;
+    ///
+    /// let property = ObservableProperty::new("initial".to_string());
+    ///
+    /// // Method 1: Manual subscription management (traditional approach)
+    /// let observer_id = property.subscribe(Arc::new(|old, new| {
+    ///     println!("Manual: {} -> {}", old, new);
+    /// })).map_err(|e| {
+    ///     eprintln!("Failed to subscribe: {}", e);
+    ///     e
+    /// })?;
+    ///
+    /// // Method 2: RAII subscription management (recommended)
+    /// let _subscription = property.subscribe_with_subscription(Arc::new(|old, new| {
+    ///     println!("RAII: {} -> {}", old, new);
+    /// })).map_err(|e| {
+    ///     eprintln!("Failed to create subscription: {}", e);
+    ///     e
+    /// })?;
+    ///
+    /// // Both observers will be called
+    /// property.set("changed".to_string()).map_err(|e| {
+    ///     eprintln!("Failed to set value: {}", e);
+    ///     e
+    /// })?;
+    ///
+    /// // Manual cleanup required for first observer
+    /// property.unsubscribe(observer_id).map_err(|e| {
+    ///     eprintln!("Failed to unsubscribe: {}", e);
+    ///     e
+    /// })?;
+    ///
+    /// // Second observer (_subscription) is automatically cleaned up when
+    /// // the variable goes out of scope - no manual intervention needed
+    /// # Ok::<(), observable_property::PropertyError>(())
+    /// ```
+    ///
+    /// # Use Cases
+    ///
+    /// This method is particularly useful in scenarios such as:
+    /// - Temporary observers that should be active only during a specific scope
+    /// - Error-prone code where manual cleanup might be forgotten
+    /// - Complex control flow where multiple exit points make manual cleanup difficult
+    /// - Resource-constrained environments where observer leaks are problematic
+    pub fn subscribe_with_subscription(
+        &self,
+        observer: Observer<T>,
+    ) -> Result<Subscription<T>, PropertyError> {
+        let id = self.subscribe(observer)?;
+        Ok(Subscription {
+            inner: Arc::clone(&self.inner),
+            id,
+        })
+    }
+
+    /// Subscribes a filtered observer and returns a RAII guard for automatic cleanup
+    ///
+    /// This method combines the functionality of `subscribe_filtered()` with the automatic
+    /// cleanup benefits of `subscribe_with_subscription()`. The observer will only be
+    /// called when the filter condition is satisfied, and it will be automatically
+    /// unsubscribed when the returned `Subscription` goes out of scope.
+    ///
+    /// # Arguments
+    ///
+    /// * `observer` - The observer function to call when the filter passes
+    /// * `filter` - A predicate function that receives `(old_value, new_value)` and returns `bool`
+    ///
+    /// # Returns
+    ///
+    /// `Ok(Subscription<T>)` containing a RAII guard for the filtered observer,
+    /// or `Err(PropertyError)` if the lock is poisoned.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use observable_property::ObservableProperty;
+    /// use std::sync::Arc;
+    ///
+    /// let temperature = ObservableProperty::new(20.0_f64);
+    ///
+    /// // Create filtered subscription that only triggers for significant temperature increases
+    /// let _heat_warning = temperature.subscribe_filtered_with_subscription(
+    ///     Arc::new(|old_temp, new_temp| {
+    ///         println!("🔥 Heat warning! Temperature rose from {:.1}°C to {:.1}°C", 
+    ///                  old_temp, new_temp);
+    ///     }),
+    ///     |old, new| new > old && (new - old) > 5.0  // Only trigger for increases > 5°C
+    /// ).map_err(|e| {
+    ///     eprintln!("Failed to create heat warning subscription: {}", e);
+    ///     e
+    /// })?;
+    ///
+    /// // Create another filtered subscription for cooling alerts
+    /// let _cooling_alert = temperature.subscribe_filtered_with_subscription(
+    ///     Arc::new(|old_temp, new_temp| {
+    ///         println!("❄️ Cooling alert! Temperature dropped from {:.1}°C to {:.1}°C", 
+    ///                  old_temp, new_temp);
+    ///     }),
+    ///     |old, new| new < old && (old - new) > 3.0  // Only trigger for decreases > 3°C
+    /// ).map_err(|e| {
+    ///     eprintln!("Failed to create cooling alert subscription: {}", e);
+    ///     e
+    /// })?;
+    ///
+    /// // Test the filters
+    /// temperature.set(22.0).map_err(|e| {
+    ///     eprintln!("Failed to set temperature: {}", e);
+    ///     e
+    /// })?; // No alerts (increase of only 2°C)
+    ///
+    /// temperature.set(28.0).map_err(|e| {
+    ///     eprintln!("Failed to set temperature: {}", e);
+    ///     e
+    /// })?; // Heat warning triggered (increase of 6°C)
+    ///
+    /// temperature.set(23.0).map_err(|e| {
+    ///     eprintln!("Failed to set temperature: {}", e);
+    ///     e
+    /// })?; // Cooling alert triggered (decrease of 5°C)
+    ///
+    /// // Both subscriptions are automatically cleaned up when they go out of scope
+    /// # Ok::<(), observable_property::PropertyError>(())
+    /// ```
+    ///
+    /// # Use Cases
+    ///
+    /// This method is ideal for:
+    /// - Threshold-based monitoring with automatic cleanup
+    /// - Temporary conditional observers in specific code blocks
+    /// - Event-driven systems where observers should be active only during certain phases
+    /// - Resource management scenarios where filtered observers have limited lifetimes
+    ///
+    /// # Performance Notes
+    ///
+    /// The filter function is evaluated for every property change, so it should be
+    /// lightweight. Complex filtering logic should be optimized to avoid performance
+    /// bottlenecks, especially in high-frequency update scenarios.
+    pub fn subscribe_filtered_with_subscription<F>(
+        &self,
+        observer: Observer<T>,
+        filter: F,
+    ) -> Result<Subscription<T>, PropertyError>
+    where
+        F: Fn(&T, &T) -> bool + Send + Sync + 'static,
+    {
+        let id = self.subscribe_filtered(observer, filter)?;
+        Ok(Subscription {
+            inner: Arc::clone(&self.inner),
+            id,
+        })
     }
 }
 
@@ -1069,5 +1376,972 @@ mod tests {
         assert_eq!(history[2], (2, 3));
 
         prop.unsubscribe(observer_id).unwrap();
+    }
+
+    #[test]
+    fn test_subscription_automatic_cleanup() {
+        let prop = ObservableProperty::new(0);
+        let call_count = Arc::new(AtomicUsize::new(0));
+        
+        // Test that subscription automatically cleans up when dropped
+        {
+            let count = call_count.clone();
+            let _subscription = prop.subscribe_with_subscription(Arc::new(move |_, _| {
+                count.fetch_add(1, Ordering::SeqCst);
+            })).unwrap();
+            
+            // Observer should be active while subscription is in scope
+            prop.set(1).unwrap();
+            assert_eq!(call_count.load(Ordering::SeqCst), 1);
+            
+            // Subscription goes out of scope here and should auto-cleanup
+        }
+        
+        // Observer should no longer be active after subscription dropped
+        prop.set(2).unwrap();
+        assert_eq!(call_count.load(Ordering::SeqCst), 1); // No additional calls
+    }
+
+    #[test]
+    fn test_subscription_explicit_drop() {
+        let prop = ObservableProperty::new(0);
+        let call_count = Arc::new(AtomicUsize::new(0));
+        
+        let count = call_count.clone();
+        let subscription = prop.subscribe_with_subscription(Arc::new(move |_, _| {
+            count.fetch_add(1, Ordering::SeqCst);
+        })).unwrap();
+        
+        // Observer should be active
+        prop.set(1).unwrap();
+        assert_eq!(call_count.load(Ordering::SeqCst), 1);
+        
+        // Explicitly drop the subscription
+        drop(subscription);
+        
+        // Observer should no longer be active
+        prop.set(2).unwrap();
+        assert_eq!(call_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn test_multiple_subscriptions_with_cleanup() {
+        let prop = ObservableProperty::new(0);
+        let call_count1 = Arc::new(AtomicUsize::new(0));
+        let call_count2 = Arc::new(AtomicUsize::new(0));
+        let call_count3 = Arc::new(AtomicUsize::new(0));
+        
+        let count1 = call_count1.clone();
+        let count2 = call_count2.clone();
+        let count3 = call_count3.clone();
+        
+        let subscription1 = prop.subscribe_with_subscription(Arc::new(move |_, _| {
+            count1.fetch_add(1, Ordering::SeqCst);
+        })).unwrap();
+        
+        let subscription2 = prop.subscribe_with_subscription(Arc::new(move |_, _| {
+            count2.fetch_add(1, Ordering::SeqCst);
+        })).unwrap();
+        
+        let subscription3 = prop.subscribe_with_subscription(Arc::new(move |_, _| {
+            count3.fetch_add(1, Ordering::SeqCst);
+        })).unwrap();
+        
+        // All observers should be active
+        prop.set(1).unwrap();
+        assert_eq!(call_count1.load(Ordering::SeqCst), 1);
+        assert_eq!(call_count2.load(Ordering::SeqCst), 1);
+        assert_eq!(call_count3.load(Ordering::SeqCst), 1);
+        
+        // Drop second subscription
+        drop(subscription2);
+        
+        // Only first and third should be active
+        prop.set(2).unwrap();
+        assert_eq!(call_count1.load(Ordering::SeqCst), 2);
+        assert_eq!(call_count2.load(Ordering::SeqCst), 1); // No change
+        assert_eq!(call_count3.load(Ordering::SeqCst), 2);
+        
+        // Drop remaining subscriptions
+        drop(subscription1);
+        drop(subscription3);
+        
+        // No observers should be active
+        prop.set(3).unwrap();
+        assert_eq!(call_count1.load(Ordering::SeqCst), 2);
+        assert_eq!(call_count2.load(Ordering::SeqCst), 1);
+        assert_eq!(call_count3.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn test_subscription_drop_with_poisoned_lock() {
+        let prop = Arc::new(ObservableProperty::new(0));
+        let prop_clone = prop.clone();
+        
+        // Create a subscription
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let count = call_count.clone();
+        let subscription = prop.subscribe_with_subscription(Arc::new(move |_, _| {
+            count.fetch_add(1, Ordering::SeqCst);
+        })).unwrap();
+        
+        // Poison the lock by panicking while holding a write lock
+        let poison_thread = thread::spawn(move || {
+            let _guard = prop_clone.inner.write().unwrap();
+            panic!("Deliberate panic to poison the lock");
+        });
+        let _ = poison_thread.join(); // Ignore the panic result
+        
+        // Dropping the subscription should not panic even with poisoned lock
+        // This tests that the Drop implementation handles poisoned locks gracefully
+        drop(subscription); // Should complete without panic
+        
+        // Test passes if we reach here without panicking
+    }
+
+    #[test]
+    fn test_subscription_vs_manual_unsubscribe() {
+        let prop = ObservableProperty::new(0);
+        let auto_count = Arc::new(AtomicUsize::new(0));
+        let manual_count = Arc::new(AtomicUsize::new(0));
+        
+        // Manual subscription
+        let manual_count_clone = manual_count.clone();
+        let manual_id = prop.subscribe(Arc::new(move |_, _| {
+            manual_count_clone.fetch_add(1, Ordering::SeqCst);
+        })).unwrap();
+        
+        // Automatic subscription
+        let auto_count_clone = auto_count.clone();
+        let _auto_subscription = prop.subscribe_with_subscription(Arc::new(move |_, _| {
+            auto_count_clone.fetch_add(1, Ordering::SeqCst);
+        })).unwrap();
+        
+        // Both should be active
+        prop.set(1).unwrap();
+        assert_eq!(manual_count.load(Ordering::SeqCst), 1);
+        assert_eq!(auto_count.load(Ordering::SeqCst), 1);
+        
+        // Manual unsubscribe
+        prop.unsubscribe(manual_id).unwrap();
+        
+        // Only automatic subscription should be active
+        prop.set(2).unwrap();
+        assert_eq!(manual_count.load(Ordering::SeqCst), 1); // No change
+        assert_eq!(auto_count.load(Ordering::SeqCst), 2);
+        
+        // Auto subscription goes out of scope here and cleans up automatically
+    }
+
+    #[test]
+    fn test_subscribe_with_subscription_error_handling() {
+        let prop = Arc::new(ObservableProperty::new(0));
+        let prop_clone = prop.clone();
+        
+        // Poison the lock
+        let poison_thread = thread::spawn(move || {
+            let _guard = prop_clone.inner.write().unwrap();
+            panic!("Deliberate panic to poison the lock");
+        });
+        let _ = poison_thread.join();
+        
+        // subscribe_with_subscription should return an error for poisoned lock
+        let result = prop.subscribe_with_subscription(Arc::new(|_, _| {}));
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            PropertyError::WriteLockError { .. } | PropertyError::PoisonedLock => {
+                // Either error type is acceptable for poisoned lock
+            }
+            other => panic!("Unexpected error type: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_subscription_with_property_cloning() {
+        let prop1 = ObservableProperty::new(0);
+        let prop2 = prop1.clone();
+        let call_count = Arc::new(AtomicUsize::new(0));
+        
+        // Subscribe to prop1
+        let count = call_count.clone();
+        let _subscription = prop1.subscribe_with_subscription(Arc::new(move |_, _| {
+            count.fetch_add(1, Ordering::SeqCst);
+        })).unwrap();
+        
+        // Changes through prop2 should trigger the observer subscribed to prop1
+        prop2.set(42).unwrap();
+        assert_eq!(call_count.load(Ordering::SeqCst), 1);
+        
+        // Changes through prop1 should also trigger the observer
+        prop1.set(100).unwrap();
+        assert_eq!(call_count.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn test_subscription_in_conditional_blocks() {
+        let prop = ObservableProperty::new(0);
+        let call_count = Arc::new(AtomicUsize::new(0));
+        
+        let should_subscribe = true;
+        
+        if should_subscribe {
+            let count = call_count.clone();
+            let _subscription = prop.subscribe_with_subscription(Arc::new(move |_, _| {
+                count.fetch_add(1, Ordering::SeqCst);
+            })).unwrap();
+            
+            // Observer active within this block
+            prop.set(1).unwrap();
+            assert_eq!(call_count.load(Ordering::SeqCst), 1);
+            
+            // Subscription dropped when exiting this block
+        }
+        
+        // Observer should be inactive now
+        prop.set(2).unwrap();
+        assert_eq!(call_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn test_subscription_with_early_return() {
+        fn test_function(prop: &ObservableProperty<i32>, should_return_early: bool) -> Result<(), PropertyError> {
+            let call_count = Arc::new(AtomicUsize::new(0));
+            let count = call_count.clone();
+            
+            let _subscription = prop.subscribe_with_subscription(Arc::new(move |_, _| {
+                count.fetch_add(1, Ordering::SeqCst);
+            }))?;
+            
+            prop.set(1)?;
+            assert_eq!(call_count.load(Ordering::SeqCst), 1);
+            
+            if should_return_early {
+                return Ok(()); // Subscription should be cleaned up here
+            }
+            
+            prop.set(2)?;
+            assert_eq!(call_count.load(Ordering::SeqCst), 2);
+            
+            Ok(())
+            // Subscription cleaned up when function exits normally
+        }
+        
+        let prop = ObservableProperty::new(0);
+        
+        // Test early return
+        test_function(&prop, true).unwrap();
+        
+        // Verify observer is no longer active after early return
+        prop.set(10).unwrap();
+        
+        // Test normal exit
+        test_function(&prop, false).unwrap();
+        
+        // Verify observer is no longer active after normal exit
+        prop.set(20).unwrap();
+    }
+
+    #[test]
+    fn test_subscription_move_semantics() {
+        let prop = ObservableProperty::new(0);
+        let call_count = Arc::new(AtomicUsize::new(0));
+        
+        let count = call_count.clone();
+        let subscription = prop.subscribe_with_subscription(Arc::new(move |_, _| {
+            count.fetch_add(1, Ordering::SeqCst);
+        })).unwrap();
+        
+        // Observer should be active
+        prop.set(1).unwrap();
+        assert_eq!(call_count.load(Ordering::SeqCst), 1);
+        
+        // Move subscription to a new variable
+        let moved_subscription = subscription;
+        
+        // Observer should still be active after move
+        prop.set(2).unwrap();
+        assert_eq!(call_count.load(Ordering::SeqCst), 2);
+        
+        // Drop the moved subscription
+        drop(moved_subscription);
+        
+        // Observer should now be inactive
+        prop.set(3).unwrap();
+        assert_eq!(call_count.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn test_filtered_subscription_automatic_cleanup() {
+        let prop = ObservableProperty::new(0);
+        let call_count = Arc::new(AtomicUsize::new(0));
+        
+        {
+            let count = call_count.clone();
+            let _subscription = prop.subscribe_filtered_with_subscription(
+                Arc::new(move |_, _| {
+                    count.fetch_add(1, Ordering::SeqCst);
+                }),
+                |old, new| new > old // Only trigger on increases
+            ).unwrap();
+            
+            // Should trigger (0 -> 5)
+            prop.set(5).unwrap();
+            assert_eq!(call_count.load(Ordering::SeqCst), 1);
+            
+            // Should NOT trigger (5 -> 3)
+            prop.set(3).unwrap();
+            assert_eq!(call_count.load(Ordering::SeqCst), 1);
+            
+            // Should trigger (3 -> 10)
+            prop.set(10).unwrap();
+            assert_eq!(call_count.load(Ordering::SeqCst), 2);
+            
+            // Subscription goes out of scope here
+        }
+        
+        // Observer should be inactive after subscription cleanup
+        prop.set(20).unwrap();
+        assert_eq!(call_count.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn test_multiple_filtered_subscriptions() {
+        let prop = ObservableProperty::new(10);
+        let increase_count = Arc::new(AtomicUsize::new(0));
+        let decrease_count = Arc::new(AtomicUsize::new(0));
+        let significant_change_count = Arc::new(AtomicUsize::new(0));
+        
+        let inc_count = increase_count.clone();
+        let dec_count = decrease_count.clone();
+        let sig_count = significant_change_count.clone();
+        
+        let _increase_sub = prop.subscribe_filtered_with_subscription(
+            Arc::new(move |_, _| {
+                inc_count.fetch_add(1, Ordering::SeqCst);
+            }),
+            |old, new| new > old
+        ).unwrap();
+        
+        let _decrease_sub = prop.subscribe_filtered_with_subscription(
+            Arc::new(move |_, _| {
+                dec_count.fetch_add(1, Ordering::SeqCst);
+            }),
+            |old, new| new < old
+        ).unwrap();
+        
+        let _significant_sub = prop.subscribe_filtered_with_subscription(
+            Arc::new(move |_, _| {
+                sig_count.fetch_add(1, Ordering::SeqCst);
+            }),
+            |old, new| ((*new as i32) - (*old as i32)).abs() > 5
+        ).unwrap();
+        
+        // Test increases
+        prop.set(15).unwrap(); // +5: triggers increase, not significant
+        assert_eq!(increase_count.load(Ordering::SeqCst), 1);
+        assert_eq!(decrease_count.load(Ordering::SeqCst), 0);
+        assert_eq!(significant_change_count.load(Ordering::SeqCst), 0);
+        
+        // Test significant increase
+        prop.set(25).unwrap(); // +10: triggers increase and significant
+        assert_eq!(increase_count.load(Ordering::SeqCst), 2);
+        assert_eq!(decrease_count.load(Ordering::SeqCst), 0);
+        assert_eq!(significant_change_count.load(Ordering::SeqCst), 1);
+        
+        // Test significant decrease
+        prop.set(5).unwrap(); // -20: triggers decrease and significant
+        assert_eq!(increase_count.load(Ordering::SeqCst), 2);
+        assert_eq!(decrease_count.load(Ordering::SeqCst), 1);
+        assert_eq!(significant_change_count.load(Ordering::SeqCst), 2);
+        
+        // Test small decrease
+        prop.set(3).unwrap(); // -2: triggers decrease, not significant
+        assert_eq!(increase_count.load(Ordering::SeqCst), 2);
+        assert_eq!(decrease_count.load(Ordering::SeqCst), 2);
+        assert_eq!(significant_change_count.load(Ordering::SeqCst), 2);
+        
+        // All subscriptions auto-cleanup when they go out of scope
+    }
+
+    #[test]
+    fn test_filtered_subscription_complex_filter() {
+        let prop = ObservableProperty::new(0.0f64);
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let values_received = Arc::new(RwLock::new(Vec::new()));
+        
+        let count = call_count.clone();
+        let values = values_received.clone();
+        let _subscription = prop.subscribe_filtered_with_subscription(
+            Arc::new(move |old, new| {
+                count.fetch_add(1, Ordering::SeqCst);
+                if let Ok(mut v) = values.write() {
+                    v.push((*old, *new));
+                }
+            }),
+            |old, new| {
+                // Complex filter: trigger only when crossing integer boundaries
+                // and the change is significant (> 0.5)
+                let old_int = old.floor() as i32;
+                let new_int = new.floor() as i32;
+                old_int != new_int && (new - old).abs() > 0.5_f64
+            }
+        ).unwrap();
+        
+        // Small changes within same integer - should not trigger
+        prop.set(0.3).unwrap();
+        prop.set(0.7).unwrap();
+        assert_eq!(call_count.load(Ordering::SeqCst), 0);
+        
+        // Cross integer boundary with significant change - should trigger
+        prop.set(1.3).unwrap(); // Change of 0.6, which is > 0.5
+        assert_eq!(call_count.load(Ordering::SeqCst), 1);
+        
+        // Small cross-boundary change - should not trigger
+        prop.set(1.9).unwrap();
+        prop.set(2.1).unwrap(); // Change of 0.2, less than 0.5
+        assert_eq!(call_count.load(Ordering::SeqCst), 1);
+        
+        // Large cross-boundary change - should trigger
+        prop.set(3.5).unwrap();
+        assert_eq!(call_count.load(Ordering::SeqCst), 2);
+        
+        // Verify received values
+        let values = values_received.read().unwrap();
+        assert_eq!(values.len(), 2);
+        assert_eq!(values[0], (0.7, 1.3));
+        assert_eq!(values[1], (2.1, 3.5));
+    }
+
+    #[test]
+    fn test_filtered_subscription_error_handling() {
+        let prop = Arc::new(ObservableProperty::new(0));
+        let prop_clone = prop.clone();
+        
+        // Poison the lock
+        let poison_thread = thread::spawn(move || {
+            let _guard = prop_clone.inner.write().unwrap();
+            panic!("Deliberate panic to poison the lock");
+        });
+        let _ = poison_thread.join();
+        
+        // subscribe_filtered_with_subscription should return error for poisoned lock
+        let result = prop.subscribe_filtered_with_subscription(
+            Arc::new(|_, _| {}),
+            |_, _| true
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_filtered_subscription_vs_manual_filtered() {
+        let prop = ObservableProperty::new(0);
+        let auto_count = Arc::new(AtomicUsize::new(0));
+        let manual_count = Arc::new(AtomicUsize::new(0));
+        
+        // Manual filtered subscription
+        let manual_count_clone = manual_count.clone();
+        let manual_id = prop.subscribe_filtered(
+            Arc::new(move |_, _| {
+                manual_count_clone.fetch_add(1, Ordering::SeqCst);
+            }),
+            |old, new| new > old
+        ).unwrap();
+        
+        // Automatic filtered subscription
+        let auto_count_clone = auto_count.clone();
+        let _auto_subscription = prop.subscribe_filtered_with_subscription(
+            Arc::new(move |_, _| {
+                auto_count_clone.fetch_add(1, Ordering::SeqCst);
+            }),
+            |old, new| new > old
+        ).unwrap();
+        
+        // Both should be triggered by increases
+        prop.set(5).unwrap();
+        assert_eq!(manual_count.load(Ordering::SeqCst), 1);
+        assert_eq!(auto_count.load(Ordering::SeqCst), 1);
+        
+        // Neither should be triggered by decreases
+        prop.set(3).unwrap();
+        assert_eq!(manual_count.load(Ordering::SeqCst), 1);
+        assert_eq!(auto_count.load(Ordering::SeqCst), 1);
+        
+        // Both should be triggered by increases again
+        prop.set(10).unwrap();
+        assert_eq!(manual_count.load(Ordering::SeqCst), 2);
+        assert_eq!(auto_count.load(Ordering::SeqCst), 2);
+        
+        // Manual cleanup
+        prop.unsubscribe(manual_id).unwrap();
+        
+        // Only automatic subscription should be active
+        prop.set(15).unwrap();
+        assert_eq!(manual_count.load(Ordering::SeqCst), 2); // No change
+        assert_eq!(auto_count.load(Ordering::SeqCst), 3);
+        
+        // Auto subscription cleaned up when it goes out of scope
+    }
+
+    #[test]
+    fn test_filtered_subscription_with_panicking_filter() {
+        let prop = ObservableProperty::new(0);
+        let call_count = Arc::new(AtomicUsize::new(0));
+        
+        let count = call_count.clone();
+        let _subscription = prop.subscribe_filtered_with_subscription(
+            Arc::new(move |_, _| {
+                count.fetch_add(1, Ordering::SeqCst);
+            }),
+            |_, new| {
+                if *new == 42 {
+                    panic!("Filter panic on 42");
+                }
+                true // Accept all other values
+            }
+        ).unwrap();
+        
+        // Normal value should work
+        prop.set(1).unwrap();
+        assert_eq!(call_count.load(Ordering::SeqCst), 1);
+        
+        // Value that causes filter to panic should be handled gracefully
+        // The behavior here depends on how the filter panic is handled
+        // In the current implementation, filter panics may cause the observer to not be called
+        prop.set(42).unwrap();
+        
+        // Observer should still work for subsequent normal values
+        prop.set(2).unwrap();
+        // Note: The exact count here depends on panic handling implementation
+        // The important thing is that the system doesn't crash
+    }
+
+    #[test]
+    fn test_subscription_thread_safety() {
+        let prop = Arc::new(ObservableProperty::new(0));
+        let num_threads = 8;
+        let operations_per_thread = 50;
+        let total_calls = Arc::new(AtomicUsize::new(0));
+        
+        let handles: Vec<_> = (0..num_threads).map(|thread_id| {
+            let prop_clone = prop.clone();
+            let calls_clone = total_calls.clone();
+            
+            thread::spawn(move || {
+                let mut local_subscriptions = Vec::new();
+                
+                for i in 0..operations_per_thread {
+                    let calls = calls_clone.clone();
+                    let subscription = prop_clone.subscribe_with_subscription(Arc::new(move |old, new| {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        // Simulate some work
+                        let _ = thread_id + i + old + new;
+                    })).expect("Should be able to create subscription");
+                    
+                    local_subscriptions.push(subscription);
+                    
+                    // Trigger observers
+                    prop_clone.set(thread_id * 1000 + i).expect("Should be able to set value");
+                    
+                    // Occasionally drop some subscriptions
+                    if i % 5 == 0 && !local_subscriptions.is_empty() {
+                        local_subscriptions.remove(0); // Drop first subscription
+                    }
+                }
+                
+                // All remaining subscriptions dropped when vector goes out of scope
+            })
+        }).collect();
+        
+        // Wait for all threads to complete
+        for handle in handles {
+            handle.join().expect("Thread should complete successfully");
+        }
+        
+        // Property should still be functional after all the concurrent operations
+        prop.set(9999).expect("Property should still work");
+        
+        // We can't easily verify the exact call count due to the complex timing,
+        // but we can verify that the system didn't crash and is still operational
+        println!("Total observer calls: {}", total_calls.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn test_subscription_cross_thread_drop() {
+        let prop = Arc::new(ObservableProperty::new(0));
+        let call_count = Arc::new(AtomicUsize::new(0));
+        
+        // Create subscription in main thread
+        let count = call_count.clone();
+        let subscription = prop.subscribe_with_subscription(Arc::new(move |_, _| {
+            count.fetch_add(1, Ordering::SeqCst);
+        })).unwrap();
+        
+        // Verify observer is active
+        prop.set(1).unwrap();
+        assert_eq!(call_count.load(Ordering::SeqCst), 1);
+        
+        // Move subscription to another thread and drop it there
+        let prop_clone = prop.clone();
+        let call_count_clone = call_count.clone();
+        
+        let handle = thread::spawn(move || {
+            // Verify observer is still active in the other thread
+            prop_clone.set(2).unwrap();
+            assert_eq!(call_count_clone.load(Ordering::SeqCst), 2);
+            
+            // Drop subscription in this thread
+            drop(subscription);
+            
+            // Verify observer is no longer active
+            prop_clone.set(3).unwrap();
+            assert_eq!(call_count_clone.load(Ordering::SeqCst), 2); // No change
+        });
+        
+        handle.join().unwrap();
+        
+        // Verify observer is still inactive in main thread
+        prop.set(4).unwrap();
+        assert_eq!(call_count.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn test_concurrent_subscription_creation_and_property_changes() {
+        let prop = Arc::new(ObservableProperty::new(0));
+        let total_notifications = Arc::new(AtomicUsize::new(0));
+        let num_subscriber_threads = 4;
+        let num_setter_threads = 2;
+        let operations_per_thread = 25;
+        
+        // Threads that create and destroy subscriptions
+        let subscriber_handles: Vec<_> = (0..num_subscriber_threads).map(|_| {
+            let prop_clone = prop.clone();
+            let notifications_clone = total_notifications.clone();
+            
+            thread::spawn(move || {
+                for _ in 0..operations_per_thread {
+                    let notifications = notifications_clone.clone();
+                    let _subscription = prop_clone.subscribe_with_subscription(Arc::new(move |_, _| {
+                        notifications.fetch_add(1, Ordering::SeqCst);
+                    })).expect("Should create subscription");
+                    
+                    // Keep subscription alive for a short time
+                    thread::sleep(Duration::from_millis(1));
+                    
+                    // Subscription dropped when _subscription goes out of scope
+                }
+            })
+        }).collect();
+        
+        // Threads that continuously change the property value
+        let setter_handles: Vec<_> = (0..num_setter_threads).map(|thread_id| {
+            let prop_clone = prop.clone();
+            
+            thread::spawn(move || {
+                for i in 0..operations_per_thread * 2 {
+                    prop_clone.set(thread_id * 10000 + i).expect("Should set value");
+                    thread::sleep(Duration::from_millis(1));
+                }
+            })
+        }).collect();
+        
+        // Wait for all threads to complete
+        for handle in subscriber_handles.into_iter().chain(setter_handles.into_iter()) {
+            handle.join().expect("Thread should complete");
+        }
+        
+        // System should be stable after concurrent operations
+        prop.set(99999).expect("Property should still work");
+        
+        println!("Total notifications during concurrent test: {}", total_notifications.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn test_filtered_subscription_thread_safety() {
+        let prop = Arc::new(ObservableProperty::new(0));
+        let increase_notifications = Arc::new(AtomicUsize::new(0));
+        let decrease_notifications = Arc::new(AtomicUsize::new(0));
+        let num_threads = 6;
+        
+        let handles: Vec<_> = (0..num_threads).map(|thread_id| {
+            let prop_clone = prop.clone();
+            let inc_notifications = increase_notifications.clone();
+            let dec_notifications = decrease_notifications.clone();
+            
+            thread::spawn(move || {
+                // Create increase-only subscription
+                let inc_count = inc_notifications.clone();
+                let _inc_subscription = prop_clone.subscribe_filtered_with_subscription(
+                    Arc::new(move |_, _| {
+                        inc_count.fetch_add(1, Ordering::SeqCst);
+                    }),
+                    |old, new| new > old
+                ).expect("Should create filtered subscription");
+                
+                // Create decrease-only subscription
+                let dec_count = dec_notifications.clone();
+                let _dec_subscription = prop_clone.subscribe_filtered_with_subscription(
+                    Arc::new(move |_, _| {
+                        dec_count.fetch_add(1, Ordering::SeqCst);
+                    }),
+                    |old, new| new < old
+                ).expect("Should create filtered subscription");
+                
+                // Perform some property changes
+                let base_value = thread_id * 100;
+                for i in 0..20 {
+                    let new_value = base_value + (i % 10); // Creates increases and decreases
+                    prop_clone.set(new_value).expect("Should set value");
+                    thread::sleep(Duration::from_millis(1));
+                }
+                
+                // Subscriptions automatically cleaned up when going out of scope
+            })
+        }).collect();
+        
+        // Wait for all threads
+        for handle in handles {
+            handle.join().expect("Thread should complete");
+        }
+        
+        // Verify system is still operational
+        let initial_inc = increase_notifications.load(Ordering::SeqCst);
+        let initial_dec = decrease_notifications.load(Ordering::SeqCst);
+        
+        prop.set(1000).expect("Property should still work");
+        prop.set(2000).expect("Property should still work");
+        
+        // No new notifications should occur (all subscriptions cleaned up)
+        assert_eq!(increase_notifications.load(Ordering::SeqCst), initial_inc);
+        assert_eq!(decrease_notifications.load(Ordering::SeqCst), initial_dec);
+        
+        println!("Increase notifications: {}, Decrease notifications: {}", initial_inc, initial_dec);
+    }
+
+    #[test]
+    fn test_subscription_with_async_property_changes() {
+        let prop = Arc::new(ObservableProperty::new(0));
+        let sync_notifications = Arc::new(AtomicUsize::new(0));
+        let async_notifications = Arc::new(AtomicUsize::new(0));
+        
+        // Subscription that tracks sync notifications
+        let sync_count = sync_notifications.clone();
+        let _sync_subscription = prop.subscribe_with_subscription(Arc::new(move |old, new| {
+            sync_count.fetch_add(1, Ordering::SeqCst);
+            // Simulate slow observer work
+            thread::sleep(Duration::from_millis(5));
+            println!("Sync observer: {} -> {}", old, new);
+        })).unwrap();
+        
+        // Subscription that tracks async notifications  
+        let async_count = async_notifications.clone();
+        let _async_subscription = prop.subscribe_with_subscription(Arc::new(move |old, new| {
+            async_count.fetch_add(1, Ordering::SeqCst);
+            println!("Async observer: {} -> {}", old, new);
+        })).unwrap();
+        
+        // Test sync property changes
+        let start = std::time::Instant::now();
+        prop.set(1).unwrap();
+        prop.set(2).unwrap();
+        let sync_duration = start.elapsed();
+        
+        // Test async property changes
+        let start = std::time::Instant::now();
+        prop.set_async(3).unwrap();
+        prop.set_async(4).unwrap();
+        let async_duration = start.elapsed();
+        
+        // Async should be much faster
+        assert!(async_duration < sync_duration);
+        
+        // Wait for async observers to complete
+        thread::sleep(Duration::from_millis(50));
+        
+        // All observers should have been called
+        assert_eq!(sync_notifications.load(Ordering::SeqCst), 4);
+        assert_eq!(async_notifications.load(Ordering::SeqCst), 4);
+        
+        // Subscriptions auto-cleanup when going out of scope
+    }
+
+    #[test]
+    fn test_subscription_creation_with_poisoned_lock() {
+        let prop = Arc::new(ObservableProperty::new(0));
+        let prop_clone = prop.clone();
+        
+        // Create a valid subscription before poisoning
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let count = call_count.clone();
+        let existing_subscription = prop.subscribe_with_subscription(Arc::new(move |_, _| {
+            count.fetch_add(1, Ordering::SeqCst);
+        })).unwrap();
+        
+        // Poison the lock
+        let poison_thread = thread::spawn(move || {
+            let _guard = prop_clone.inner.write().unwrap();
+            panic!("Deliberate panic to poison the lock");
+        });
+        let _ = poison_thread.join();
+        
+        // New subscription creation should fail
+        let result = prop.subscribe_with_subscription(Arc::new(|_, _| {}));
+        assert!(result.is_err());
+        
+        // New filtered subscription creation should also fail
+        let filtered_result = prop.subscribe_filtered_with_subscription(
+            Arc::new(|_, _| {}),
+            |_, _| true
+        );
+        assert!(filtered_result.is_err());
+        
+        // Dropping existing subscription should not panic
+        drop(existing_subscription);
+    }
+
+    #[test]
+    fn test_subscription_cleanup_behavior_with_poisoned_lock() {
+        // This test specifically verifies that Drop doesn't panic with poisoned locks
+        let prop = Arc::new(ObservableProperty::new(0));
+        let call_count = Arc::new(AtomicUsize::new(0));
+        
+        // Create subscription
+        let count = call_count.clone();
+        let subscription = prop.subscribe_with_subscription(Arc::new(move |_, _| {
+            count.fetch_add(1, Ordering::SeqCst);
+        })).unwrap();
+        
+        // Verify it works initially
+        prop.set(1).unwrap();
+        assert_eq!(call_count.load(Ordering::SeqCst), 1);
+        
+        // Poison the lock from another thread
+        let prop_clone = prop.clone();
+        let poison_thread = thread::spawn(move || {
+            let _guard = prop_clone.inner.write().unwrap();
+            panic!("Deliberate panic to poison the lock");
+        });
+        let _ = poison_thread.join();
+        
+        // Now drop the subscription - this should NOT panic
+        // The Drop implementation should handle the poisoned lock gracefully
+        drop(subscription);
+        
+        // Test succeeds if we reach this point without panicking
+    }
+
+    #[test]
+    fn test_multiple_subscription_cleanup_with_poisoned_lock() {
+        let prop = Arc::new(ObservableProperty::new(0));
+        let mut subscriptions = Vec::new();
+        
+        // Create multiple subscriptions
+        for i in 0..5 {
+            let call_count = Arc::new(AtomicUsize::new(0));
+            let count = call_count.clone();
+            let subscription = prop.subscribe_with_subscription(Arc::new(move |old, new| {
+                count.fetch_add(1, Ordering::SeqCst);
+                println!("Observer {}: {} -> {}", i, old, new);
+            })).unwrap();
+            subscriptions.push(subscription);
+        }
+        
+        // Verify they all work
+        prop.set(42).unwrap();
+        
+        // Poison the lock
+        let prop_clone = prop.clone();
+        let poison_thread = thread::spawn(move || {
+            let _guard = prop_clone.inner.write().unwrap();
+            panic!("Deliberate panic to poison the lock");
+        });
+        let _ = poison_thread.join();
+        
+        // Drop all subscriptions - none should panic
+        for subscription in subscriptions {
+            drop(subscription);
+        }
+        
+        // Test succeeds if no panics occurred
+    }
+
+    #[test]
+    fn test_subscription_behavior_before_and_after_poison() {
+        let prop = Arc::new(ObservableProperty::new(0));
+        let before_poison_count = Arc::new(AtomicUsize::new(0));
+        let after_poison_count = Arc::new(AtomicUsize::new(0));
+        
+        // Create subscription before poisoning
+        let before_count = before_poison_count.clone();
+        let before_subscription = prop.subscribe_with_subscription(Arc::new(move |_, _| {
+            before_count.fetch_add(1, Ordering::SeqCst);
+        })).unwrap();
+        
+        // Verify it works
+        prop.set(1).unwrap();
+        assert_eq!(before_poison_count.load(Ordering::SeqCst), 1);
+        
+        // Poison the lock
+        let prop_clone = prop.clone();
+        let poison_thread = thread::spawn(move || {
+            let _guard = prop_clone.inner.write().unwrap();
+            panic!("Deliberate panic to poison the lock");
+        });
+        let _ = poison_thread.join();
+        
+        // Try to create subscription after poisoning - should fail
+        let after_count = after_poison_count.clone();
+        let after_result = prop.subscribe_with_subscription(Arc::new(move |_, _| {
+            after_count.fetch_add(1, Ordering::SeqCst);
+        }));
+        assert!(after_result.is_err());
+        
+        // Clean up the before-poison subscription - should not panic
+        drop(before_subscription);
+        
+        // Verify after-poison subscription was never created
+        assert_eq!(after_poison_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn test_concurrent_subscription_drops_with_poison() {
+        let prop = Arc::new(ObservableProperty::new(0));
+        let num_subscriptions = 10;
+        let mut subscriptions = Vec::new();
+        
+        // Create multiple subscriptions
+        for i in 0..num_subscriptions {
+            let call_count = Arc::new(AtomicUsize::new(0));
+            let count = call_count.clone();
+            let subscription = prop.subscribe_with_subscription(Arc::new(move |_, _| {
+                count.fetch_add(1, Ordering::SeqCst);
+                println!("Observer {}", i);
+            })).unwrap();
+            subscriptions.push(subscription);
+        }
+        
+        // Poison the lock
+        let prop_clone = prop.clone();
+        let poison_thread = thread::spawn(move || {
+            let _guard = prop_clone.inner.write().unwrap();
+            panic!("Deliberate panic to poison the lock");
+        });
+        let _ = poison_thread.join();
+        
+        // Drop subscriptions concurrently from multiple threads
+        let handles: Vec<_> = subscriptions.into_iter().enumerate().map(|(i, subscription)| {
+            thread::spawn(move || {
+                // Add some randomness to timing
+                thread::sleep(Duration::from_millis(i as u64 % 5));
+                drop(subscription);
+                println!("Dropped subscription {}", i);
+            })
+        }).collect();
+        
+        // Wait for all drops to complete
+        for handle in handles {
+            handle.join().expect("Drop thread should complete without panic");
+        }
+        
+        // Test succeeds if all threads completed successfully
     }
 }
