@@ -230,6 +230,7 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::mem;
 use std::panic;
 use std::sync::{Arc, RwLock};
 use std::thread;
@@ -610,6 +611,7 @@ impl<T: Clone + Send + Sync + 'static> Drop for Subscription<T> {
 pub struct ObservableProperty<T> {
     inner: Arc<RwLock<InnerProperty<T>>>,
     max_threads: usize,
+    max_observers: usize,
 }
 
 struct InnerProperty<T> {
@@ -644,6 +646,7 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
                 next_id: 0,
             })),
             max_threads: MAX_THREADS,
+            max_observers: MAX_OBSERVERS,
         }
     }
 
@@ -657,7 +660,7 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
     ///
     /// * `initial_value` - The starting value for this property
     /// * `max_threads` - Maximum number of threads to use for async notifications.
-    ///                   If 0 is provided, defaults to 4.
+    ///   If 0 is provided, defaults to 4.
     ///
     /// # Thread Pool Behavior
     ///
@@ -735,6 +738,7 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
                 next_id: 0,
             })),
             max_threads,
+            max_observers: MAX_OBSERVERS,
         }
     }
 
@@ -821,8 +825,8 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
                 }
             };
 
-            let old_value = prop.value.clone();
-            prop.value = new_value.clone();
+            // Performance optimization: use mem::replace to avoid one clone operation
+            let old_value = mem::replace(&mut prop.value, new_value.clone());
             let observers_snapshot: Vec<Observer<T>> = prop.observers.values().cloned().collect();
             (old_value, observers_snapshot)
         };
@@ -859,6 +863,9 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
     /// - ⚠️ **No completion guarantee**: Thread may still be running when method returns
     /// - ⚠️ **No error propagation**: Observer errors are logged but not returned
     /// - ⚠️ **Testing caveat**: May need explicit delays to observe side effects
+    /// - ⚠️ **Ordering caveat**: Multiple rapid `set_async()` calls may result in observers
+    ///   receiving notifications out of order due to thread scheduling. Use `set()` if
+    ///   sequential ordering is critical.
     ///
     /// ## Use Cases:
     /// - **UI updates**: Fire updates without blocking the main thread
@@ -974,8 +981,8 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
                 }
             };
 
-            let old_value = prop.value.clone();
-            prop.value = new_value.clone();
+            // Performance optimization: use mem::replace to avoid one clone operation
+            let old_value = mem::replace(&mut prop.value, new_value.clone());
             let observers_snapshot: Vec<Observer<T>> = prop.observers.values().cloned().collect();
             (old_value, observers_snapshot)
         };
@@ -1069,19 +1076,22 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
         };
 
         // Check observer limit to prevent memory exhaustion
-        if prop.observers.len() >= MAX_OBSERVERS {
+        if prop.observers.len() >= self.max_observers {
             return Err(PropertyError::InvalidConfiguration {
                 reason: format!(
                     "Maximum observer limit ({}) exceeded. Current observers: {}. \
                      Consider unsubscribing unused observers to free resources.",
-                    MAX_OBSERVERS,
+                    self.max_observers,
                     prop.observers.len()
                 ),
             });
         }
 
         let id = prop.next_id;
-        prop.next_id += 1;
+        // Use wrapping_add to prevent overflow panics in production
+        // After ~usize::MAX subscriptions, IDs will wrap around
+        // This is acceptable as old observers are typically unsubscribed
+        prop.next_id = prop.next_id.wrapping_add(1);
         prop.observers.insert(id, observer);
         Ok(id)
     }
@@ -1623,6 +1633,191 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
             id,
         })
     }
+
+    /// Creates a new observable property with full configuration control
+    ///
+    /// This constructor provides complete control over the property's configuration,
+    /// allowing you to customize both thread pool size and maximum observer count.
+    ///
+    /// # Arguments
+    ///
+    /// * `initial_value` - The starting value for this property
+    /// * `max_threads` - Maximum threads for async notifications (0 = use default)
+    /// * `max_observers` - Maximum number of allowed observers (0 = use default)
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use observable_property::ObservableProperty;
+    ///
+    /// // Create a property optimized for high-frequency updates with many observers
+    /// let property = ObservableProperty::with_config(0, 8, 50000);
+    /// assert_eq!(property.get().unwrap(), 0);
+    /// ```
+    pub fn with_config(initial_value: T, max_threads: usize, max_observers: usize) -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(InnerProperty {
+                value: initial_value,
+                observers: HashMap::new(),
+                next_id: 0,
+            })),
+            max_threads: if max_threads == 0 { MAX_THREADS } else { max_threads },
+            max_observers: if max_observers == 0 { MAX_OBSERVERS } else { max_observers },
+        }
+    }
+
+    /// Returns the current number of active observers
+    ///
+    /// This method is useful for debugging, monitoring, and testing to verify
+    /// that observers are being properly managed and cleaned up.
+    ///
+    /// # Returns
+    ///
+    /// The number of currently subscribed observers, or 0 if the lock is poisoned.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use observable_property::ObservableProperty;
+    /// use std::sync::Arc;
+    ///
+    /// # fn main() -> Result<(), observable_property::PropertyError> {
+    /// let property = ObservableProperty::new(42);
+    /// assert_eq!(property.observer_count(), 0);
+    ///
+    /// let id1 = property.subscribe(Arc::new(|_, _| {}))?;
+    /// assert_eq!(property.observer_count(), 1);
+    ///
+    /// let id2 = property.subscribe(Arc::new(|_, _| {}))?;
+    /// assert_eq!(property.observer_count(), 2);
+    ///
+    /// property.unsubscribe(id1)?;
+    /// assert_eq!(property.observer_count(), 1);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn observer_count(&self) -> usize {
+        match self.inner.read() {
+            Ok(prop) => prop.observers.len(),
+            Err(poisoned) => {
+                // Graceful degradation: recover from poisoned lock
+                poisoned.into_inner().observers.len()
+            }
+        }
+    }
+
+    /// Gets the current value without Result wrapping
+    ///
+    /// This is a convenience method that returns `None` if the lock is poisoned
+    /// (which shouldn't happen with graceful degradation) instead of a Result.
+    ///
+    /// # Returns
+    ///
+    /// `Some(T)` containing the current value, or `None` if somehow inaccessible.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use observable_property::ObservableProperty;
+    ///
+    /// let property = ObservableProperty::new(42);
+    /// assert_eq!(property.try_get(), Some(42));
+    /// ```
+    pub fn try_get(&self) -> Option<T> {
+        self.get().ok()
+    }
+
+    /// Atomically modifies the property value using a closure
+    ///
+    /// This method allows you to update the property based on its current value
+    /// in a single atomic operation. The closure receives a mutable reference to
+    /// the value and can modify it in place.
+    ///
+    /// # Arguments
+    ///
+    /// * `f` - A closure that receives `&mut T` and modifies it
+    ///
+    /// # Returns
+    ///
+    /// `Ok(())` if successful, or `Err(PropertyError)` if the lock is poisoned.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use observable_property::ObservableProperty;
+    /// use std::sync::Arc;
+    ///
+    /// # fn main() -> Result<(), observable_property::PropertyError> {
+    /// let counter = ObservableProperty::new(0);
+    ///
+    /// counter.subscribe(Arc::new(|old, new| {
+    ///     println!("Counter: {} -> {}", old, new);
+    /// }))?;
+    ///
+    /// // Increment counter atomically
+    /// counter.modify(|value| *value += 1)?;
+    /// assert_eq!(counter.get()?, 1);
+    ///
+    /// // Double the counter atomically
+    /// counter.modify(|value| *value *= 2)?;
+    /// assert_eq!(counter.get()?, 2);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn modify<F>(&self, f: F) -> Result<(), PropertyError>
+    where
+        F: FnOnce(&mut T),
+    {
+        let (old_value, new_value, observers_snapshot) = {
+            let mut prop = match self.inner.write() {
+                Ok(guard) => guard,
+                Err(poisoned) => {
+                    // Graceful degradation: recover from poisoned write lock
+                    poisoned.into_inner()
+                }
+            };
+
+            let old_value = prop.value.clone();
+            f(&mut prop.value);
+            let new_value = prop.value.clone();
+            let observers_snapshot: Vec<Observer<T>> = prop.observers.values().cloned().collect();
+            (old_value, new_value, observers_snapshot)
+        };
+
+        // Notify observers with old and new values
+        for observer in observers_snapshot {
+            if let Err(e) = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+                observer(&old_value, &new_value);
+            })) {
+                eprintln!("Observer panic in modify: {:?}", e);
+            }
+        }
+
+        Ok(())
+    }
+}
+
+impl<T: Clone + Default + Send + Sync + 'static> ObservableProperty<T> {
+    /// Gets the current value or returns the default if inaccessible
+    ///
+    /// This convenience method is only available when `T` implements `Default`.
+    /// It provides a fallback to `T::default()` if the value cannot be read.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use observable_property::ObservableProperty;
+    ///
+    /// let property = ObservableProperty::new(42);
+    /// assert_eq!(property.get_or_default(), 42);
+    ///
+    /// // Even if somehow inaccessible, returns default
+    /// let empty_property: ObservableProperty<i32> = ObservableProperty::new(0);
+    /// assert_eq!(empty_property.get_or_default(), 0);
+    /// ```
+    pub fn get_or_default(&self) -> T {
+        self.get().unwrap_or_default()
+    }
 }
 
 impl<T: Clone> Clone for ObservableProperty<T> {
@@ -1659,6 +1854,7 @@ impl<T: Clone> Clone for ObservableProperty<T> {
         Self {
             inner: Arc::clone(&self.inner),
             max_threads: self.max_threads,
+            max_observers: self.max_observers,
         }
     }
 }
@@ -1672,11 +1868,14 @@ impl<T: Clone + std::fmt::Debug + Send + Sync + 'static> std::fmt::Debug for Obs
                 .field("value", &value)
                 .field("observers_count", &"[hidden]")
                 .field("max_threads", &self.max_threads)
+                .field("max_observers", &self.max_observers)
                 .finish(),
             Err(_) => f
                 .debug_struct("ObservableProperty")
                 .field("value", &"[inaccessible]")
                 .field("observers_count", &"[hidden]")
+                .field("max_threads", &self.max_threads)
+                .field("max_observers", &self.max_observers)
                 .finish(),
         }
     }
