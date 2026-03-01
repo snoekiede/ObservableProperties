@@ -20,6 +20,8 @@
 
 A thread-safe observable property implementation for Rust that allows you to observe changes to values across multiple threads. Built with comprehensive error handling and no `unwrap()` calls for maximum reliability.
 
+### Contact me
+If you find bugs, please mail me at snoekiede@gmail.com and mention the name of the crate in the subject.
 ## Quick Start
 
 Add this to your `Cargo.toml`:
