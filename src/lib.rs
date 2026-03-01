@@ -9755,5 +9755,744 @@ mod tests {
         assert_eq!(notification_count.load(Ordering::SeqCst), 1);
         assert_eq!(prop.get().unwrap(), 20);
     }
+
+    // ========================================================================
+    // Validation Tests
+    // ========================================================================
+
+    #[test]
+    fn test_with_validator_basic() {
+        let result = ObservableProperty::with_validator(25, |age| {
+            if *age <= 150 {
+                Ok(())
+            } else {
+                Err(format!("Age must be at most 150, got {}", age))
+            }
+        });
+
+        assert!(result.is_ok());
+        let prop = result.unwrap();
+        assert_eq!(prop.get().unwrap(), 25);
+
+        // Valid update
+        assert!(prop.set(30).is_ok());
+        assert_eq!(prop.get().unwrap(), 30);
+
+        // Invalid update
+        let invalid_result = prop.set(200);
+        assert!(invalid_result.is_err());
+        assert_eq!(prop.get().unwrap(), 30); // Value unchanged
+    }
+
+    #[test]
+    fn test_with_validator_rejects_invalid_initial_value() {
+        let result = ObservableProperty::with_validator(200, |age| {
+            if *age <= 150 {
+                Ok(())
+            } else {
+                Err(format!("Age must be at most 150, got {}", age))
+            }
+        });
+
+        assert!(result.is_err());
+        match result {
+            Err(PropertyError::ValidationError { reason }) => {
+                assert!(reason.contains("200"));
+            }
+            _ => panic!("Expected ValidationError"),
+        }
+    }
+
+    #[test]
+    fn test_with_validator_string_validation() {
+        let result = ObservableProperty::with_validator("alice".to_string(), |name| {
+            if name.is_empty() {
+                return Err("Username cannot be empty".to_string());
+            }
+            if name.len() < 3 {
+                return Err(format!("Username must be at least 3 characters, got {}", name.len()));
+            }
+            if !name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                return Err("Username can only contain letters, numbers, and underscores".to_string());
+            }
+            Ok(())
+        });
+
+        assert!(result.is_ok());
+        let prop = result.unwrap();
+
+        assert!(prop.set("bob".to_string()).is_ok());
+        assert!(prop.set("ab".to_string()).is_err()); // Too short
+        assert!(prop.set("user@123".to_string()).is_err()); // Invalid chars
+        assert_eq!(prop.get().unwrap(), "bob");
+    }
+
+    #[test]
+    fn test_with_validator_with_observers() {
+        let prop = ObservableProperty::with_validator(10, |val| {
+            if *val >= 0 && *val <= 100 {
+                Ok(())
+            } else {
+                Err(format!("Value must be between 0 and 100, got {}", val))
+            }
+        }).unwrap();
+
+        let notification_count = Arc::new(AtomicUsize::new(0));
+        let count_clone = notification_count.clone();
+
+        prop.subscribe(Arc::new(move |_, _| {
+            count_clone.fetch_add(1, Ordering::SeqCst);
+        })).unwrap();
+
+        // Valid update - should notify
+        prop.set(50).unwrap();
+        assert_eq!(notification_count.load(Ordering::SeqCst), 1);
+
+        // Invalid update - should not notify
+        prop.set(150).unwrap_err();
+        assert_eq!(notification_count.load(Ordering::SeqCst), 1); // No additional notification
+    }
+
+    // ========================================================================
+    // Custom Equality Tests
+    // ========================================================================
+
+    #[test]
+    fn test_with_equality_basic() {
+        // Create property where values within 5 are considered equal
+        let prop = ObservableProperty::with_equality(10i32, |a, b| (a - b).abs() <= 5);
+        let notification_count = Arc::new(AtomicUsize::new(0));
+        let count_clone = notification_count.clone();
+
+        prop.subscribe(Arc::new(move |_, _| {
+            count_clone.fetch_add(1, Ordering::SeqCst);
+        })).unwrap();
+
+        // Small change - should not notify
+        prop.set(12).unwrap();
+        assert_eq!(notification_count.load(Ordering::SeqCst), 0);
+
+        // Large change - should notify
+        prop.set(20).unwrap();
+        assert_eq!(notification_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn test_with_equality_string_case_insensitive() {
+        let prop = ObservableProperty::with_equality("Hello".to_string(), |a, b| {
+            a.to_lowercase() == b.to_lowercase()
+        });
+
+        let notification_count = Arc::new(AtomicUsize::new(0));
+        let count_clone = notification_count.clone();
+
+        prop.subscribe(Arc::new(move |_, _| {
+            count_clone.fetch_add(1, Ordering::SeqCst);
+        })).unwrap();
+
+        // Same case-insensitive - should not notify
+        prop.set("hello".to_string()).unwrap();
+        assert_eq!(notification_count.load(Ordering::SeqCst), 0);
+
+        // Different case-insensitive - should notify
+        prop.set("World".to_string()).unwrap();
+        assert_eq!(notification_count.load(Ordering::SeqCst), 1);
+    }
+
+    // ========================================================================
+    // History Tests
+    // ========================================================================
+
+    #[test]
+    fn test_with_history_basic() {
+        let prop = ObservableProperty::with_history(0, 5);
+
+        prop.set(10).unwrap();
+        prop.set(20).unwrap();
+        prop.set(30).unwrap();
+
+        assert_eq!(prop.get().unwrap(), 30);
+
+        // Undo
+        prop.undo().unwrap();
+        assert_eq!(prop.get().unwrap(), 20);
+
+        prop.undo().unwrap();
+        assert_eq!(prop.get().unwrap(), 10);
+
+        prop.undo().unwrap();
+        assert_eq!(prop.get().unwrap(), 0);
+    }
+
+    #[test]
+    fn test_with_history_get_history() {
+        let prop = ObservableProperty::with_history("start".to_string(), 3);
+
+        prop.set("second".to_string()).unwrap();
+        prop.set("third".to_string()).unwrap();
+        prop.set("fourth".to_string()).unwrap();
+
+        let history = prop.get_history();
+        assert_eq!(history.len(), 3);
+        assert_eq!(history[0], "start");
+        assert_eq!(history[1], "second");
+        assert_eq!(history[2], "third");
+        assert_eq!(prop.get().unwrap(), "fourth");
+    }
+
+    #[test]
+    fn test_with_history_bounded_buffer() {
+        let prop = ObservableProperty::with_history(1, 2);
+
+        prop.set(2).unwrap();
+        prop.set(3).unwrap();
+        prop.set(4).unwrap();
+
+        let history = prop.get_history();
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0], 2);
+        assert_eq!(history[1], 3);
+        assert_eq!(prop.get().unwrap(), 4);
+    }
+
+    #[test]
+    fn test_undo_no_history() {
+        let prop = ObservableProperty::new(42);
+        let result = prop.undo();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_undo_empty_history() {
+        let prop = ObservableProperty::with_history(42, 5);
+        let result = prop.undo();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_history_with_observers() {
+        let prop = ObservableProperty::with_history(0, 5);
+        let notifications = Arc::new(RwLock::new(Vec::new()));
+        let notifs_clone = notifications.clone();
+
+        prop.subscribe(Arc::new(move |old, new| {
+            if let Ok(mut notifs) = notifs_clone.write() {
+                notifs.push((*old, *new));
+            }
+        })).unwrap();
+
+        prop.set(10).unwrap();
+        prop.set(20).unwrap();
+        prop.undo().unwrap(); // Should notify: 20 -> 10
+
+        let notifs = notifications.read().unwrap();
+        assert_eq!(notifs.len(), 3);
+        assert_eq!(notifs[0], (0, 10));
+        assert_eq!(notifs[1], (10, 20));
+        assert_eq!(notifs[2], (20, 10)); // Undo notification
+    }
+
+    // ========================================================================
+    // Event Logging Tests
+    // ========================================================================
+
+    #[test]
+    fn test_with_event_log_basic() {
+        let counter = ObservableProperty::with_event_log(0, 0);
+
+        counter.set(1).unwrap();
+        counter.set(2).unwrap();
+        counter.set(3).unwrap();
+
+        let events = counter.get_event_log();
+        assert_eq!(events.len(), 3);
+
+        assert_eq!(events[0].old_value, 0);
+        assert_eq!(events[0].new_value, 1);
+        assert_eq!(events[0].event_number, 0);
+
+        assert_eq!(events[2].old_value, 2);
+        assert_eq!(events[2].new_value, 3);
+        assert_eq!(events[2].event_number, 2);
+    }
+
+    #[test]
+    fn test_with_event_log_bounded() {
+        let prop = ObservableProperty::with_event_log(100, 3);
+
+        prop.set(101).unwrap();
+        prop.set(102).unwrap();
+        prop.set(103).unwrap();
+        prop.set(104).unwrap();
+
+        let events = prop.get_event_log();
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0].old_value, 101);
+        assert_eq!(events[2].new_value, 104);
+    }
+
+    #[test]
+    fn test_event_log_timestamps() {
+        let prop = ObservableProperty::with_event_log(0, 0);
+
+        let before = Instant::now();
+        thread::sleep(Duration::from_millis(10));
+        prop.set(1).unwrap();
+        thread::sleep(Duration::from_millis(10));
+        prop.set(2).unwrap();
+        let after = Instant::now();
+
+        let events = prop.get_event_log();
+        assert_eq!(events.len(), 2);
+        assert!(events[0].timestamp >= before);
+        assert!(events[1].timestamp <= after);
+        assert!(events[1].timestamp >= events[0].timestamp);
+    }
+
+    // ========================================================================
+    // Property Transformation Tests (map)
+    // ========================================================================
+
+    #[test]
+    fn test_map_basic() {
+        let celsius = ObservableProperty::new(20.0);
+        let fahrenheit = celsius.map(|c| c * 9.0 / 5.0 + 32.0).unwrap();
+
+        assert_eq!(fahrenheit.get().unwrap(), 68.0);
+
+        celsius.set(25.0).unwrap();
+        thread::sleep(Duration::from_millis(10)); // Give observer time to fire
+        assert_eq!(fahrenheit.get().unwrap(), 77.0);
+
+        celsius.set(0.0).unwrap();
+        thread::sleep(Duration::from_millis(10));
+        assert_eq!(fahrenheit.get().unwrap(), 32.0);
+    }
+
+    #[test]
+    fn test_map_string_formatting() {
+        let count = ObservableProperty::new(42);
+        let message = count.map(|n| format!("Count: {}", n)).unwrap();
+
+        assert_eq!(message.get().unwrap(), "Count: 42");
+
+        count.set(100).unwrap();
+        thread::sleep(Duration::from_millis(10));
+        assert_eq!(message.get().unwrap(), "Count: 100");
+    }
+
+    #[test]
+    fn test_map_chaining() {
+        let base = ObservableProperty::new(10);
+        let doubled = base.map(|x| x * 2).unwrap();
+        let squared = doubled.map(|x| x * x).unwrap();
+
+        assert_eq!(squared.get().unwrap(), 400); // (10 * 2)^2 = 400
+
+        base.set(5).unwrap();
+        thread::sleep(Duration::from_millis(20));
+        assert_eq!(squared.get().unwrap(), 100); // (5 * 2)^2 = 100
+    }
+
+    #[test]
+    fn test_map_type_conversion() {
+        let integer = ObservableProperty::new(42);
+        let float_value = integer.map(|i| *i as f64).unwrap();
+        let is_even = integer.map(|i| i % 2 == 0).unwrap();
+
+        assert_eq!(float_value.get().unwrap(), 42.0);
+        assert_eq!(is_even.get().unwrap(), true);
+
+        integer.set(43).unwrap();
+        thread::sleep(Duration::from_millis(10));
+        assert_eq!(is_even.get().unwrap(), false);
+    }
+
+    // ========================================================================
+    // Modify Tests
+    // ========================================================================
+
+    #[test]
+    fn test_modify_basic() {
+        let counter = ObservableProperty::new(0);
+        let notifications = Arc::new(RwLock::new(Vec::new()));
+        let notifs_clone = notifications.clone();
+
+        counter.subscribe(Arc::new(move |old, new| {
+            if let Ok(mut notifs) = notifs_clone.write() {
+                notifs.push((*old, *new));
+            }
+        })).unwrap();
+
+        counter.modify(|value| *value += 1).unwrap();
+        assert_eq!(counter.get().unwrap(), 1);
+
+        counter.modify(|value| *value *= 2).unwrap();
+        assert_eq!(counter.get().unwrap(), 2);
+
+        let notifs = notifications.read().unwrap();
+        assert_eq!(notifs.len(), 2);
+        assert_eq!(notifs[0], (0, 1));
+        assert_eq!(notifs[1], (1, 2));
+    }
+
+    #[test]
+    fn test_modify_with_validator() {
+        let prop = ObservableProperty::with_validator(10, |val| {
+            if *val >= 0 && *val <= 100 {
+                Ok(())
+            } else {
+                Err("Value must be between 0 and 100".to_string())
+            }
+        }).unwrap();
+
+        // Valid modification
+        assert!(prop.modify(|v| *v += 5).is_ok());
+        assert_eq!(prop.get().unwrap(), 15);
+
+        // Invalid modification
+        let result = prop.modify(|v| *v += 100);
+        assert!(result.is_err());
+        assert_eq!(prop.get().unwrap(), 15); // Value unchanged
+    }
+
+    #[test]
+    fn test_modify_string() {
+        let text = ObservableProperty::new("hello".to_string());
+
+        text.modify(|s| {
+            *s = s.to_uppercase();
+        }).unwrap();
+
+        assert_eq!(text.get().unwrap(), "HELLO");
+
+        text.modify(|s| {
+            s.push_str(" WORLD");
+        }).unwrap();
+
+        assert_eq!(text.get().unwrap(), "HELLO WORLD");
+    }
+
+    // ========================================================================
+    // Bidirectional Binding Tests
+    // ========================================================================
+
+    #[test]
+    fn test_bind_bidirectional_basic() {
+        let prop1 = Arc::new(ObservableProperty::new(10));
+        let prop2 = Arc::new(ObservableProperty::new(10)); // Start with same value
+
+        prop1.bind_bidirectional(&prop2).unwrap();
+
+        // Change prop1 - prop2 should update
+        prop1.set(30).unwrap();
+        thread::sleep(Duration::from_millis(20));
+        assert_eq!(prop2.get().unwrap(), 30);
+
+        // Change prop2 - prop1 should update
+        prop2.set(40).unwrap();
+        thread::sleep(Duration::from_millis(20));
+        assert_eq!(prop1.get().unwrap(), 40);
+    }
+
+    #[test]
+    fn test_bind_bidirectional_strings() {
+        let prop1 = Arc::new(ObservableProperty::new("first".to_string()));
+        let prop2 = Arc::new(ObservableProperty::new("first".to_string())); // Start with same value
+
+        prop1.bind_bidirectional(&prop2).unwrap();
+
+        // Change prop2
+        prop2.set("updated".to_string()).unwrap();
+        thread::sleep(Duration::from_millis(20));
+        assert_eq!(prop1.get().unwrap(), "updated");
+
+        // Change prop1
+        prop1.set("final".to_string()).unwrap();
+        thread::sleep(Duration::from_millis(20));
+        assert_eq!(prop2.get().unwrap(), "final");
+    }
+
+    // ========================================================================
+    // Comprehensive Metrics Tests
+    // ========================================================================
+
+    #[test]
+    fn test_get_metrics_basic() {
+        let prop = ObservableProperty::new(0);
+        
+        prop.subscribe(Arc::new(|_, _| {
+            thread::sleep(Duration::from_millis(5));
+        })).unwrap();
+
+        prop.set(1).unwrap();
+        prop.set(2).unwrap();
+        prop.set(3).unwrap();
+
+        let metrics = prop.get_metrics().unwrap();
+        assert_eq!(metrics.total_changes, 3);
+        assert_eq!(metrics.observer_calls, 3);
+        assert!(metrics.avg_notification_time.as_millis() >= 4);
+    }
+
+    #[test]
+    fn test_metrics_multiple_observers() {
+        let prop = ObservableProperty::new(0);
+        
+        for _ in 0..3 {
+            prop.subscribe(Arc::new(|_, _| {})).unwrap();
+        }
+
+        prop.set(1).unwrap();
+        prop.set(2).unwrap();
+
+        let metrics = prop.get_metrics().unwrap();
+        assert_eq!(metrics.total_changes, 2);
+        assert_eq!(metrics.observer_calls, 6); // 2 changes * 3 observers
+    }
+
+    #[test]
+    fn test_metrics_no_observers() {
+        let prop = ObservableProperty::new(0);
+
+        prop.set(1).unwrap();
+        prop.set(2).unwrap();
+
+        let metrics = prop.get_metrics().unwrap();
+        assert_eq!(metrics.total_changes, 2);
+        assert_eq!(metrics.observer_calls, 0);
+    }
+
+    // ========================================================================
+    // Debug Logging Tests (when debug feature is enabled)
+    // ========================================================================
+
+    #[test]
+    #[cfg(feature = "debug")]
+    fn test_enable_disable_change_logging() {
+        let prop = ObservableProperty::new(0);
+
+        prop.enable_change_logging();
+        prop.set(1).unwrap();
+        prop.set(2).unwrap();
+        prop.disable_change_logging();
+        prop.set(3).unwrap();
+
+        // With debug feature enabled, change logs should be recorded
+        // This is a basic compile test to ensure the methods exist
+    }
+
+    // ========================================================================
+    // Async Features Tests
+    // ========================================================================
+
+    #[cfg(feature = "async")]
+    #[tokio::test]
+    async fn test_wait_for_basic() {
+        let prop = Arc::new(ObservableProperty::new(0));
+        let prop_clone = prop.clone();
+
+        // Spawn task to change value after delay
+        tokio::spawn(async move {
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+            prop_clone.set(42).unwrap();
+        });
+
+        // Wait for value to become 42
+        prop.wait_for(|v| *v == 42).await;
+        assert_eq!(prop.get().unwrap(), 42);
+    }
+
+    #[cfg(feature = "async")]
+    #[tokio::test]
+    async fn test_wait_for_already_true() {
+        let prop = ObservableProperty::new(100);
+
+        // Predicate is already true
+        prop.wait_for(|v| *v >= 50).await;
+        assert_eq!(prop.get().unwrap(), 100);
+    }
+
+    // ========================================================================
+    // Observer Count Tests
+    // ========================================================================
+
+    #[test]
+    fn test_observer_count() {
+        let prop = ObservableProperty::new(0);
+        assert_eq!(prop.observer_count(), 0);
+
+        let _id1 = prop.subscribe(Arc::new(|_, _| {})).unwrap();
+        assert_eq!(prop.observer_count(), 1);
+
+        let _id2 = prop.subscribe(Arc::new(|_, _| {})).unwrap();
+        assert_eq!(prop.observer_count(), 2);
+
+        let _id3 = prop.subscribe(Arc::new(|_, _| {})).unwrap();
+        assert_eq!(prop.observer_count(), 3);
+    }
+
+    #[test]
+    fn test_observer_count_after_unsubscribe() {
+        let prop = ObservableProperty::new(0);
+
+        let id1 = prop.subscribe(Arc::new(|_, _| {})).unwrap();
+        let id2 = prop.subscribe(Arc::new(|_, _| {})).unwrap();
+        assert_eq!(prop.observer_count(), 2);
+
+        prop.unsubscribe(id1).unwrap();
+        assert_eq!(prop.observer_count(), 1);
+
+        prop.unsubscribe(id2).unwrap();
+        assert_eq!(prop.observer_count(), 0);
+    }
+
+    // ========================================================================
+    // With Config Tests
+    // ========================================================================
+
+    #[test]
+    fn test_with_config_custom_limits() {
+        let prop = ObservableProperty::with_config(42, 2, 5);
+
+        // Should be able to add up to 5 observers
+        for _ in 0..5 {
+            assert!(prop.subscribe(Arc::new(|_, _| {})).is_ok());
+        }
+
+        assert_eq!(prop.observer_count(), 5);
+
+        // 6th observer should fail due to limit
+        let result = prop.subscribe(Arc::new(|_, _| {}));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_with_config_max_threads() {
+        let prop = ObservableProperty::with_config(0, 1, 100);
+        let call_count = Arc::new(AtomicUsize::new(0));
+
+        for _ in 0..4 {
+            let count = call_count.clone();
+            prop.subscribe(Arc::new(move |_, _| {
+                thread::sleep(Duration::from_millis(25));
+                count.fetch_add(1, Ordering::SeqCst);
+            })).unwrap();
+        }
+
+        // With max_threads = 1, async should still work but sequentially
+        let start = Instant::now();
+        prop.set_async(42).unwrap();
+        let duration = start.elapsed();
+
+        // Should return quickly
+        assert!(duration.as_millis() < 50);
+
+        // Wait for observers
+        thread::sleep(Duration::from_millis(150));
+        assert_eq!(call_count.load(Ordering::SeqCst), 4);
+    }
+
+    // ========================================================================
+    // Persistence Tests
+    // ========================================================================
+
+    struct MockPersistence {
+        data: Arc<RwLock<Option<i32>>>,
+    }
+
+    impl PropertyPersistence for MockPersistence {
+        type Value = i32;
+
+        fn load(&self) -> Result<Self::Value, Box<dyn std::error::Error + Send + Sync>> {
+            self.data
+                .read()
+                .unwrap()
+                .ok_or_else(|| "No data".into())
+        }
+
+        fn save(&self, value: &Self::Value) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            *self.data.write().unwrap() = Some(*value);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn test_with_persistence_load_success() {
+        let storage = Arc::new(RwLock::new(Some(42)));
+        let persistence = MockPersistence { data: storage.clone() };
+
+        let prop = ObservableProperty::with_persistence(0, persistence);
+        
+        // Should load 42 from persistence
+        assert_eq!(prop.get().unwrap(), 42);
+    }
+
+    #[test]
+    fn test_with_persistence_auto_save() {
+        let storage = Arc::new(RwLock::new(None));
+        let persistence = MockPersistence { data: storage.clone() };
+
+        let prop = ObservableProperty::with_persistence(10, persistence);
+        
+        // Change value - should auto-save
+        prop.set(20).unwrap();
+        thread::sleep(Duration::from_millis(10));
+
+        // Check storage
+        assert_eq!(*storage.read().unwrap(), Some(20));
+
+        prop.set(30).unwrap();
+        thread::sleep(Duration::from_millis(10));
+        assert_eq!(*storage.read().unwrap(), Some(30));
+    }
+
+    #[test]
+    fn test_with_persistence_load_failure_uses_default() {
+        let storage = Arc::new(RwLock::new(None));
+        let persistence = MockPersistence { data: storage };
+
+        // Load will fail, should use initial_value
+        let prop = ObservableProperty::with_persistence(99, persistence);
+        assert_eq!(prop.get().unwrap(), 99);
+    }
+
+    // ========================================================================
+    // Computed Properties Tests (additional coverage)
+    // ========================================================================
+
+    #[test]
+    fn test_computed_updates_immediately() {
+        let a = Arc::new(ObservableProperty::new(5));
+        let b = Arc::new(ObservableProperty::new(10));
+
+        let sum = computed(
+            vec![a.clone(), b.clone()],
+            |values| values[0] + values[1]
+        ).unwrap();
+
+        assert_eq!(sum.get().unwrap(), 15);
+
+        a.set(7).unwrap();
+        thread::sleep(Duration::from_millis(10));
+        assert_eq!(sum.get().unwrap(), 17);
+    }
+
+    #[test]
+    fn test_computed_with_string() {
+        let first = Arc::new(ObservableProperty::new("Hello".to_string()));
+        let last = Arc::new(ObservableProperty::new("World".to_string()));
+
+        let full = computed(
+            vec![first.clone(), last.clone()],
+            |values| format!("{} {}", values[0], values[1])
+        ).unwrap();
+
+        assert_eq!(full.get().unwrap(), "Hello World");
+
+        first.set("Goodbye".to_string()).unwrap();
+        thread::sleep(Duration::from_millis(10));
+        assert_eq!(full.get().unwrap(), "Goodbye World");
+    }
 }
 
