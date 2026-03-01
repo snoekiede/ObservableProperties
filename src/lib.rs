@@ -509,6 +509,44 @@ impl<T: Clone + Send + Sync + 'static> ObserverRef<T> {
 /// Unique identifier for registered observers
 pub type ObserverId = usize;
 
+/// Performance metrics for an observable property
+///
+/// This struct provides insight into property usage patterns and observer
+/// notification performance, useful for debugging and performance optimization.
+///
+/// # Examples
+///
+/// ```rust
+/// use observable_property::ObservableProperty;
+/// use std::sync::Arc;
+///
+/// # fn main() -> Result<(), observable_property::PropertyError> {
+/// let property = ObservableProperty::new(0);
+///
+/// property.subscribe(Arc::new(|old, new| {
+///     println!("Value changed: {} -> {}", old, new);
+/// }))?;
+///
+/// property.set(42)?;
+/// property.set(100)?;
+///
+/// let metrics = property.get_metrics()?;
+/// println!("Total changes: {}", metrics.total_changes);
+/// println!("Observer calls: {}", metrics.observer_calls);
+/// println!("Avg notification time: {:?}", metrics.avg_notification_time);
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug, Clone)]
+pub struct PropertyMetrics {
+    /// Total number of times the property value has changed
+    pub total_changes: usize,
+    /// Total number of observer calls (notification events)
+    pub observer_calls: usize,
+    /// Average time taken to notify all observers per change
+    pub avg_notification_time: Duration,
+}
+
 /// A RAII guard for an observer subscription that automatically unsubscribes when dropped
 ///
 /// This struct provides automatic cleanup for observer subscriptions using RAII (Resource
@@ -724,6 +762,10 @@ where
     next_id: ObserverId,
     history: Option<Vec<T>>,
     history_size: usize,
+    // Metrics tracking
+    total_changes: usize,
+    observer_calls: usize,
+    notification_times: Vec<Duration>,
 }
 
 impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
@@ -752,6 +794,9 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
                 next_id: 0,
                 history: None,
                 history_size: 0,
+                total_changes: 0,
+                observer_calls: 0,
+                notification_times: Vec::new(),
             })),
             max_threads: MAX_THREADS,
             max_observers: MAX_OBSERVERS,
@@ -846,6 +891,9 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
                 next_id: 0,
                 history: None,
                 history_size: 0,
+                total_changes: 0,
+                observer_calls: 0,
+                notification_times: Vec::new(),
             })),
             max_threads,
             max_observers: MAX_OBSERVERS,
@@ -1155,6 +1203,9 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
                     None
                 },
                 history_size,
+                total_changes: 0,
+                observer_calls: 0,
+                notification_times: Vec::new(),
             })),
             max_threads: MAX_THREADS,
             max_observers: MAX_OBSERVERS,
@@ -1531,6 +1582,90 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
         }
     }
 
+    /// Returns performance metrics for this property
+    ///
+    /// Provides insight into property usage patterns and observer notification
+    /// performance. This is useful for profiling, debugging, and performance
+    /// optimization.
+    ///
+    /// # Metrics Provided
+    ///
+    /// - **total_changes**: Number of times the property value has been changed
+    /// - **observer_calls**: Total number of observer notification calls made
+    /// - **avg_notification_time**: Average time taken to notify all observers
+    ///
+    /// # Note
+    ///
+    /// - For `set_async()`, the notification time measures the time to spawn threads,
+    ///   not the actual observer execution time (since threads are fire-and-forget).
+    /// - Observer calls are counted even if they panic (panic recovery continues).
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use observable_property::ObservableProperty;
+    /// use std::sync::Arc;
+    ///
+    /// # fn main() -> Result<(), observable_property::PropertyError> {
+    /// let property = ObservableProperty::new(0);
+    ///
+    /// // Subscribe multiple observers
+    /// property.subscribe(Arc::new(|old, new| {
+    ///     println!("Observer 1: {} -> {}", old, new);
+    /// }))?;
+    ///
+    /// property.subscribe(Arc::new(|old, new| {
+    ///     println!("Observer 2: {} -> {}", old, new);
+    /// }))?;
+    ///
+    /// // Make some changes
+    /// property.set(42)?;
+    /// property.set(100)?;
+    /// property.set(200)?;
+    ///
+    /// // Get performance metrics
+    /// let metrics = property.get_metrics()?;
+    /// println!("Total changes: {}", metrics.total_changes); // 3
+    /// println!("Observer calls: {}", metrics.observer_calls); // 6 (3 changes × 2 observers)
+    /// println!("Avg notification time: {:?}", metrics.avg_notification_time);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn get_metrics(&self) -> Result<PropertyMetrics, PropertyError> {
+        match self.inner.read() {
+            Ok(prop) => {
+                let avg_notification_time = if prop.notification_times.is_empty() {
+                    Duration::from_secs(0)
+                } else {
+                    let total: Duration = prop.notification_times.iter().sum();
+                    total / prop.notification_times.len() as u32
+                };
+
+                Ok(PropertyMetrics {
+                    total_changes: prop.total_changes,
+                    observer_calls: prop.observer_calls,
+                    avg_notification_time,
+                })
+            }
+            Err(poisoned) => {
+                // Graceful degradation: recover metrics from poisoned lock
+                let prop = poisoned.into_inner();
+                let avg_notification_time = if prop.notification_times.is_empty() {
+                    Duration::from_secs(0)
+                } else {
+                    let total: Duration = prop.notification_times.iter().sum();
+                    total / prop.notification_times.len() as u32
+                };
+
+                Ok(PropertyMetrics {
+                    total_changes: prop.total_changes,
+                    observer_calls: prop.observer_calls,
+                    avg_notification_time,
+                })
+            }
+        }
+    }
+
     /// Sets the property to a new value and notifies all observers
     ///
     /// This method will:
@@ -1572,6 +1707,7 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
     /// # Ok::<(), observable_property::PropertyError>(())
     /// ```
     pub fn set(&self, new_value: T) -> Result<(), PropertyError> {
+        let notification_start = Instant::now();
         let (old_value, observers_snapshot, dead_observer_ids) = {
             let mut prop = match self.inner.write() {
                 Ok(guard) => guard,
@@ -1584,6 +1720,9 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
 
             // Performance optimization: use mem::replace to avoid one clone operation
             let old_value = mem::replace(&mut prop.value, new_value.clone());
+            
+            // Track the change
+            prop.total_changes += 1;
             
             // Add old value to history if history tracking is enabled
             let history_size = prop.history_size;
@@ -1614,12 +1753,24 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
         };
 
         // Notify all active observers
+        let observer_count = observers_snapshot.len();
         for observer in observers_snapshot {
             if let Err(e) = panic::catch_unwind(panic::AssertUnwindSafe(|| {
                 observer(&old_value, &new_value);
             })) {
                 eprintln!("Observer panic: {:?}", e);
             }
+        }
+        
+        // Record metrics
+        let notification_time = notification_start.elapsed();
+        {
+            let mut prop = match self.inner.write() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            prop.observer_calls += observer_count;
+            prop.notification_times.push(notification_time);
         }
 
         // Clean up dead weak observers
@@ -1766,6 +1917,7 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
     /// # }
     /// ```
     pub fn set_async(&self, new_value: T) -> Result<(), PropertyError> {
+        let notification_start = Instant::now();
         let (old_value, observers_snapshot, dead_observer_ids) = {
             let mut prop = match self.inner.write() {
                 Ok(guard) => guard,
@@ -1777,6 +1929,9 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
 
             // Performance optimization: use mem::replace to avoid one clone operation
             let old_value = mem::replace(&mut prop.value, new_value.clone());
+            
+            // Track the change
+            prop.total_changes += 1;
             
             // Add old value to history if history tracking is enabled
             let history_size = prop.history_size;
@@ -1822,6 +1977,9 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
 
         let observers_per_thread = observers_snapshot.len().div_ceil(self.max_threads);
 
+        // Record metrics for async notifications (time to spawn threads, not execute)
+        let observer_count = observers_snapshot.len();
+        
         // Fire-and-forget pattern: Spawn threads without joining
         // This is intentional for non-blocking behavior. Observers run independently
         // and the caller continues immediately without waiting for completion.
@@ -1843,6 +2001,17 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
                 }
             });
             // Thread handle intentionally dropped - fire-and-forget pattern
+        }
+        
+        // Record notification time (time to spawn all threads)
+        let notification_time = notification_start.elapsed();
+        {
+            let mut prop = match self.inner.write() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            prop.observer_calls += observer_count;
+            prop.notification_times.push(notification_time);
         }
 
         // Clean up dead weak observers
@@ -3149,6 +3318,9 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
                 next_id: 0,
                 history: None,
                 history_size: 0,
+                total_changes: 0,
+                observer_calls: 0,
+                notification_times: Vec::new(),
             })),
             max_threads: if max_threads == 0 { MAX_THREADS } else { max_threads },
             max_observers: if max_observers == 0 { MAX_OBSERVERS } else { max_observers },
