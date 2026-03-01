@@ -239,6 +239,9 @@ use std::time::{Duration, Instant};
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
+#[cfg(feature = "debug")]
+use backtrace::Backtrace;
+
 /// Maximum number of background threads used for asynchronous observer notifications
 ///
 /// This constant controls the degree of parallelism when using `set_async()` to notify
@@ -766,6 +769,22 @@ where
     total_changes: usize,
     observer_calls: usize,
     notification_times: Vec<Duration>,
+    // Debug tracking
+    #[cfg(feature = "debug")]
+    debug_logging_enabled: bool,
+    #[cfg(feature = "debug")]
+    change_logs: Vec<ChangeLog>,
+}
+
+/// Information about a property change with stack trace
+#[cfg(feature = "debug")]
+#[derive(Clone)]
+struct ChangeLog {
+    timestamp: Instant,
+    old_value_repr: String,
+    new_value_repr: String,
+    backtrace: String,
+    thread_id: String,
 }
 
 impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
@@ -797,6 +816,10 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
                 total_changes: 0,
                 observer_calls: 0,
                 notification_times: Vec::new(),
+                #[cfg(feature = "debug")]
+                debug_logging_enabled: false,
+                #[cfg(feature = "debug")]
+                change_logs: Vec::new(),
             })),
             max_threads: MAX_THREADS,
             max_observers: MAX_OBSERVERS,
@@ -894,6 +917,10 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
                 total_changes: 0,
                 observer_calls: 0,
                 notification_times: Vec::new(),
+                #[cfg(feature = "debug")]
+                debug_logging_enabled: false,
+                #[cfg(feature = "debug")]
+                change_logs: Vec::new(),
             })),
             max_threads,
             max_observers: MAX_OBSERVERS,
@@ -1206,6 +1233,10 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
                 total_changes: 0,
                 observer_calls: 0,
                 notification_times: Vec::new(),
+                #[cfg(feature = "debug")]
+                debug_logging_enabled: false,
+                #[cfg(feature = "debug")]
+                change_logs: Vec::new(),
             })),
             max_threads: MAX_THREADS,
             max_observers: MAX_OBSERVERS,
@@ -1370,6 +1401,7 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
             let previous_value = history.pop().unwrap();
             let old_value = mem::replace(&mut prop.value, previous_value.clone());
 
+            // Debug logging (requires T: std::fmt::Debug when debug feature is enabled)
             // Collect active observers (same pattern as set())
             let mut observers_snapshot = Vec::new();
             let mut dead_ids = Vec::new();
@@ -3321,6 +3353,10 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
                 total_changes: 0,
                 observer_calls: 0,
                 notification_times: Vec::new(),
+                #[cfg(feature = "debug")]
+                debug_logging_enabled: false,
+                #[cfg(feature = "debug")]
+                change_logs: Vec::new(),
             })),
             max_threads: if max_threads == 0 { MAX_THREADS } else { max_threads },
             max_observers: if max_observers == 0 { MAX_OBSERVERS } else { max_observers },
@@ -4009,6 +4045,311 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
         Ok(())
     }
 }
+
+// Debug feature methods - only available when T implements Debug
+#[cfg(feature = "debug")]
+impl<T: Clone + Send + Sync + std::fmt::Debug + 'static> ObservableProperty<T> {
+    /// Manually logs a property change with stack trace.
+    ///
+    /// Captures and stores:
+    /// - Timestamp of the change
+    /// - Old and new values (formatted via Debug trait)
+    /// - Full stack trace at the call site
+    /// - Thread ID
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # #[cfg(feature = "debug")]
+    /// # {
+    /// use observable_property::ObservableProperty;
+    ///
+    /// let property = ObservableProperty::new(42);
+    /// property.enable_change_logging();
+    ///
+    /// let old = property.get().expect("Failed to get value");
+    /// property.set(100).ok();
+    /// property.log_change(&old, &100, "Updated from main");
+    ///
+    /// let logs = property.get_change_logs();
+    /// assert_eq!(logs.len(), 1);
+    /// # }
+    /// ```
+    pub fn log_change(&self, old_value: &T, new_value: &T, label: &str) {
+        let mut prop = match self.inner.write() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+
+        if !prop.debug_logging_enabled {
+            return;
+        }
+
+        let backtrace = Backtrace::new();
+        let thread_id = format!("{:?}", thread::current().id());
+        let old_value_repr = format!("{:?}", old_value);
+        let new_value_repr = format!("{:?} ({})", new_value, label);
+
+        prop.change_logs.push(ChangeLog {
+            timestamp: Instant::now(),
+            old_value_repr,
+            new_value_repr,
+            backtrace: format!("{:?}", backtrace),
+            thread_id,
+        });
+    }
+
+    /// Enables debug logging of property changes.
+    ///
+    /// After calling this method, use `log_change()` to manually record changes
+    /// with stack traces. Logs can be retrieved with `get_change_logs()`.
+    ///
+    /// # Performance Impact
+    ///
+    /// Stack trace capture has significant overhead:
+    /// - ~10-100μs per change (varies by platform and stack depth)
+    /// - Memory usage grows with change count (no automatic limit)
+    /// - Only enable during debugging/development
+    ///
+    /// # Requirements
+    ///
+    /// This method is only available when the `debug` feature is enabled:
+    /// ```toml
+    /// [dependencies]
+    /// observable-property = { version = "0.4", features = ["debug"] }
+    /// ```
+    ///
+    /// Additionally, the type `T` must implement `std::fmt::Debug` for value logging.
+    ///
+    /// # Examples
+    ///
+    /// ## Basic Debug Logging
+    /// ```rust
+    /// # #[cfg(feature = "debug")]
+    /// # {
+    /// use observable_property::ObservableProperty;
+    ///
+    /// let property = ObservableProperty::new(42);
+    /// property.enable_change_logging();
+    ///
+    /// let old = property.get().expect("Failed to get");
+    /// property.set(100).ok();
+    /// property.log_change(&old, &100, "update 1");
+    ///
+    /// let old = property.get().expect("Failed to get");
+    /// property.set(200).ok();
+    /// property.log_change(&old, &200, "update 2");
+    ///
+    /// // Each change is now logged with a stack trace
+    /// let logs = property.get_change_logs();
+    /// assert_eq!(logs.len(), 2);
+    /// # }
+    /// ```
+    ///
+    /// ## Debugging Unexpected Changes
+    /// ```rust
+    /// # #[cfg(feature = "debug")]
+    /// # {
+    /// use observable_property::ObservableProperty;
+    /// use std::sync::Arc;
+    /// use std::thread;
+    ///
+    /// let property = Arc::new(ObservableProperty::new(0));
+    /// property.enable_change_logging();
+    ///
+    /// // Multiple threads modifying the property
+    /// let handles: Vec<_> = (0..3).map(|i| {
+    ///     let prop = property.clone();
+    ///     thread::spawn(move || {
+    ///         let old = prop.get().expect("Failed to get");
+    ///         let new_val = i * 10;
+    ///         prop.set(new_val).ok();
+    ///         prop.log_change(&old, &new_val, "thread update");
+    ///     })
+    /// }).collect();
+    ///
+    /// for h in handles { h.join().ok(); }
+    ///
+    /// // Print detailed logs showing which thread made each change
+    /// property.print_change_logs();
+    /// # }
+    /// ```
+    ///
+    /// # See Also
+    ///
+    /// - [`disable_change_logging`](#method.disable_change_logging) - Stop capturing logs
+    /// - [`get_change_logs`](#method.get_change_logs) - Retrieve captured logs
+    /// - [`print_change_logs`](#method.print_change_logs) - Pretty-print logs to stdout
+    /// - [`clear_change_logs`](#method.clear_change_logs) - Clear accumulated logs
+    pub fn enable_change_logging(&self) {
+        let mut prop = match self.inner.write() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        prop.debug_logging_enabled = true;
+    }
+
+    /// Disables debug logging of property changes
+    ///
+    /// Stops capturing new change logs, but preserves existing logs.
+    /// Use `clear_change_logs()` to remove accumulated logs.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # #[cfg(feature = "debug")]
+    /// # {
+    /// use observable_property::ObservableProperty;
+    ///
+    /// let property = ObservableProperty::new(42);
+    /// property.enable_change_logging();
+    ///
+    /// let old = property.get().expect("Failed to get");
+    /// property.set(100).ok();
+    /// property.log_change(&old, &100, "logged"); // Logged
+    ///
+    /// property.disable_change_logging();
+    ///
+    /// let old = property.get().expect("Failed to get");
+    /// property.set(200).ok();
+    /// property.log_change(&old, &200, "not logged"); // Not logged
+    ///
+    /// let logs = property.get_change_logs();
+    /// assert_eq!(logs.len(), 1); // Only the first change
+    /// # }
+    /// ```
+    pub fn disable_change_logging(&self) {
+        let mut prop = match self.inner.write() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        prop.debug_logging_enabled = false;
+    }
+
+    /// Clears all accumulated change logs
+    ///
+    /// Removes all captured change logs from memory. The debug logging
+    /// enabled/disabled state is not affected.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # #[cfg(feature = "debug")]
+    /// # {
+    /// use observable_property::ObservableProperty;
+    ///
+    /// let property = ObservableProperty::new(42);
+    /// property.enable_change_logging();
+    ///
+    /// let old = property.get().expect("Failed to get");
+    /// property.set(100).ok();
+    /// property.log_change(&old, &100, "update");
+    ///
+    /// assert_eq!(property.get_change_logs().len(), 1);
+    /// property.clear_change_logs();
+    /// assert_eq!(property.get_change_logs().len(), 0);
+    /// # }
+    /// ```
+    pub fn clear_change_logs(&self) {
+        let mut prop = match self.inner.write() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        prop.change_logs.clear();
+    }
+
+    /// Retrieves all captured change logs
+    ///
+    /// Returns a vector of formatted strings, each containing:
+    /// - Timestamp (relative to first log)
+    /// - Thread ID
+    /// - Old and new values
+    /// - Full stack trace
+    ///
+    /// # Returns
+    ///
+    /// A vector of log strings, one per captured change, in chronological order.
+    /// Returns an empty vector if no changes have been logged.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # #[cfg(feature = "debug")]
+    /// # {
+    /// use observable_property::ObservableProperty;
+    ///
+    /// let property = ObservableProperty::new(42);
+    /// property.enable_change_logging();
+    ///
+    /// let old = property.get().expect("Failed to get");
+    /// property.set(100).ok();
+    /// property.log_change(&old, &100, "update");
+    ///
+    /// for log in property.get_change_logs() {
+    ///     println!("{}", log);
+    /// }
+    /// # }
+    /// ```
+    pub fn get_change_logs(&self) -> Vec<String> {
+        let prop = match self.inner.read() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        
+        if prop.change_logs.is_empty() {
+            return Vec::new();
+        }
+
+        let first_timestamp = prop.change_logs[0].timestamp;
+        prop.change_logs.iter().map(|log| {
+            let elapsed = log.timestamp.duration_since(first_timestamp);
+            format!(
+                "[+{:.3}s] Thread: {}\n  {} -> {}\n  Stack trace:\n{}\n",
+                elapsed.as_secs_f64(),
+                log.thread_id,
+                log.old_value_repr,
+                log.new_value_repr,
+                log.backtrace
+            )
+        }).collect()
+    }
+
+    /// Pretty-prints all change logs to stdout
+    ///
+    /// This is a convenience method that prints each log entry in a readable format.
+    /// Useful for quick debugging in terminals.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # #[cfg(feature = "debug")]
+    /// # {
+    /// use observable_property::ObservableProperty;
+    ///
+    /// let property = ObservableProperty::new(42);
+    /// property.enable_change_logging();
+    ///
+    /// let old = property.get().expect("Failed to get");
+    /// property.set(100).ok();
+    /// property.log_change(&old, &100, "update 1");
+    ///
+    /// let old = property.get().expect("Failed to get");
+    /// property.set(200).ok();
+    /// property.log_change(&old, &200, "update 2");
+    ///
+    /// // Prints formatted logs to stdout
+    /// property.print_change_logs();
+    /// # }
+    /// ```
+    pub fn print_change_logs(&self) {
+        println!("===== Property Change Logs =====");
+        for log in self.get_change_logs() {
+            println!("{}", log);
+        }
+        println!("================================");
+    }
+}
+
 
 impl<T: Clone + Default + Send + Sync + 'static> ObservableProperty<T> {
     /// Gets the current value or returns the default if inaccessible
