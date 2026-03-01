@@ -774,6 +774,9 @@ where
     debug_logging_enabled: bool,
     #[cfg(feature = "debug")]
     change_logs: Vec<ChangeLog>,
+    // Change coalescing
+    batch_depth: usize,
+    batch_initial_value: Option<T>,
 }
 
 /// Information about a property change with stack trace
@@ -820,6 +823,8 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
                 debug_logging_enabled: false,
                 #[cfg(feature = "debug")]
                 change_logs: Vec::new(),
+                batch_depth: 0,
+                batch_initial_value: None,
             })),
             max_threads: MAX_THREADS,
             max_observers: MAX_OBSERVERS,
@@ -921,6 +926,8 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
                 debug_logging_enabled: false,
                 #[cfg(feature = "debug")]
                 change_logs: Vec::new(),
+                batch_depth: 0,
+                batch_initial_value: None,
             })),
             max_threads,
             max_observers: MAX_OBSERVERS,
@@ -1237,6 +1244,8 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
                 debug_logging_enabled: false,
                 #[cfg(feature = "debug")]
                 change_logs: Vec::new(),
+                batch_depth: 0,
+                batch_initial_value: None,
             })),
             max_threads: MAX_THREADS,
             max_observers: MAX_OBSERVERS,
@@ -1740,7 +1749,7 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
     /// ```
     pub fn set(&self, new_value: T) -> Result<(), PropertyError> {
         let notification_start = Instant::now();
-        let (old_value, observers_snapshot, dead_observer_ids) = {
+        let (old_value, observers_snapshot, dead_observer_ids, in_batch) = {
             let mut prop = match self.inner.write() {
                 Ok(guard) => guard,
                 Err(poisoned) => {
@@ -1749,6 +1758,9 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
                     poisoned.into_inner()
                 }
             };
+
+            // Check if we're in a batch update
+            let in_batch = prop.batch_depth > 0;
 
             // Performance optimization: use mem::replace to avoid one clone operation
             let old_value = mem::replace(&mut prop.value, new_value.clone());
@@ -1769,20 +1781,27 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
                 }
             }
             
-            // Collect active observers and track dead weak observers
+            // Collect active observers and track dead weak observers (only if not in batch)
             let mut observers_snapshot = Vec::new();
             let mut dead_ids = Vec::new();
-            for (id, observer_ref) in &prop.observers {
-                if let Some(observer) = observer_ref.try_call() {
-                    observers_snapshot.push(observer);
-                } else {
-                    // Weak observer is dead, mark for removal
-                    dead_ids.push(*id);
+            if !in_batch {
+                for (id, observer_ref) in &prop.observers {
+                    if let Some(observer) = observer_ref.try_call() {
+                        observers_snapshot.push(observer);
+                    } else {
+                        // Weak observer is dead, mark for removal
+                        dead_ids.push(*id);
+                    }
                 }
             }
             
-            (old_value, observers_snapshot, dead_ids)
+            (old_value, observers_snapshot, dead_ids, in_batch)
         };
+
+        // Skip notifications if we're in a batch update
+        if in_batch {
+            return Ok(());
+        }
 
         // Notify all active observers
         let observer_count = observers_snapshot.len();
@@ -1950,7 +1969,7 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
     /// ```
     pub fn set_async(&self, new_value: T) -> Result<(), PropertyError> {
         let notification_start = Instant::now();
-        let (old_value, observers_snapshot, dead_observer_ids) = {
+        let (old_value, observers_snapshot, dead_observer_ids, in_batch) = {
             let mut prop = match self.inner.write() {
                 Ok(guard) => guard,
                 Err(poisoned) => {
@@ -1958,6 +1977,9 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
                     poisoned.into_inner()
                 }
             };
+
+            // Check if we're in a batch update
+            let in_batch = prop.batch_depth > 0;
 
             // Performance optimization: use mem::replace to avoid one clone operation
             let old_value = mem::replace(&mut prop.value, new_value.clone());
@@ -1978,20 +2000,27 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
                 }
             }
             
-            // Collect active observers and track dead weak observers
+            // Collect active observers and track dead weak observers (only if not in batch)
             let mut observers_snapshot = Vec::new();
             let mut dead_ids = Vec::new();
-            for (id, observer_ref) in &prop.observers {
-                if let Some(observer) = observer_ref.try_call() {
-                    observers_snapshot.push(observer);
-                } else {
-                    // Weak observer is dead, mark for removal
-                    dead_ids.push(*id);
+            if !in_batch {
+                for (id, observer_ref) in &prop.observers {
+                    if let Some(observer) = observer_ref.try_call() {
+                        observers_snapshot.push(observer);
+                    } else {
+                        // Weak observer is dead, mark for removal
+                        dead_ids.push(*id);
+                    }
                 }
             }
             
-            (old_value, observers_snapshot, dead_ids)
+            (old_value, observers_snapshot, dead_ids, in_batch)
         };
+
+        // Skip notifications if we're in a batch update
+        if in_batch {
+            return Ok(());
+        }
 
         if observers_snapshot.is_empty() {
             // Clean up dead weak observers before returning
@@ -2054,6 +2083,200 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
             };
             for id in dead_observer_ids {
                 prop.observers.remove(&id);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Begins a batch update, suppressing observer notifications
+    ///
+    /// Call this method to start a batch of updates where you want to change
+    /// the value multiple times but only notify observers once at the end.
+    /// This is useful for bulk updates where intermediate values don't matter.
+    ///
+    /// # Nested Batches
+    ///
+    /// This method supports nesting - you can call `begin_update()` multiple times
+    /// and must call `end_update()` the same number of times. Observers will only
+    /// be notified when the outermost batch is completed.
+    ///
+    /// # Thread Safety
+    ///
+    /// Each batch is scoped to the current execution context. If you begin a batch
+    /// in one thread, it won't affect other threads.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use observable_property::ObservableProperty;
+    /// use std::sync::Arc;
+    ///
+    /// # fn main() -> Result<(), observable_property::PropertyError> {
+    /// let property = ObservableProperty::new(0);
+    ///
+    /// property.subscribe(Arc::new(|old, new| {
+    ///     println!("Value changed: {} -> {}", old, new);
+    /// }))?;
+    ///
+    /// // Begin batch update
+    /// property.begin_update()?;
+    ///
+    /// // These changes won't trigger notifications
+    /// property.set(10)?;
+    /// property.set(20)?;
+    /// property.set(30)?;
+    ///
+    /// // End batch - single notification from 0 to 30
+    /// property.end_update()?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// ## Nested Batches
+    ///
+    /// ```rust
+    /// use observable_property::ObservableProperty;
+    /// use std::sync::Arc;
+    ///
+    /// # fn main() -> Result<(), observable_property::PropertyError> {
+    /// let property = ObservableProperty::new(0);
+    ///
+    /// property.subscribe(Arc::new(|old, new| {
+    ///     println!("Value changed: {} -> {}", old, new);
+    /// }))?;
+    ///
+    /// property.begin_update()?; // Outer batch
+    /// property.set(5)?;
+    ///
+    /// property.begin_update()?; // Inner batch
+    /// property.set(10)?;
+    /// property.end_update()?; // End inner batch (no notification yet)
+    ///
+    /// property.set(15)?;
+    /// property.end_update()?; // End outer batch - notification sent: 0 -> 15
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn begin_update(&self) -> Result<(), PropertyError> {
+        let mut prop = match self.inner.write() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+
+        if prop.batch_depth == 0 {
+            // Store the initial value when starting a new batch
+            prop.batch_initial_value = Some(prop.value.clone());
+        }
+
+        prop.batch_depth += 1;
+        Ok(())
+    }
+
+    /// Ends a batch update, sending a single notification with the final value
+    ///
+    /// This method completes a batch update started with `begin_update()`. When the
+    /// outermost batch is completed, observers will be notified once with the value
+    /// change from the start of the batch to the final value.
+    ///
+    /// # Behavior
+    ///
+    /// - If the value hasn't changed during the batch, no notification is sent
+    /// - Supports nested batches - only notifies when all batches are complete
+    /// - If called without a matching `begin_update()`, returns an error
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use observable_property::ObservableProperty;
+    /// use std::sync::Arc;
+    ///
+    /// # fn main() -> Result<(), observable_property::PropertyError> {
+    /// let property = ObservableProperty::new(0);
+    ///
+    /// property.subscribe(Arc::new(|old, new| {
+    ///     println!("Value changed: {} -> {}", old, new);
+    /// }))?;
+    ///
+    /// property.begin_update()?;
+    /// property.set(10)?;
+    /// property.set(20)?;
+    /// property.end_update()?; // Prints: "Value changed: 0 -> 20"
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn end_update(&self) -> Result<(), PropertyError> {
+        let notification_start = Instant::now();
+        let (should_notify, old_value, new_value, observers_snapshot, dead_observer_ids) = {
+            let mut prop = match self.inner.write() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+
+            if prop.batch_depth == 0 {
+                return Err(PropertyError::InvalidConfiguration {
+                    reason: "end_update() called without matching begin_update()".to_string(),
+                });
+            }
+
+            prop.batch_depth -= 1;
+
+            // Only notify when we've exited all nested batches
+            if prop.batch_depth == 0 {
+                if let Some(initial_value) = prop.batch_initial_value.take() {
+                    let current_value = prop.value.clone();
+                    
+                    // Collect observers if value changed
+                    let mut observers_snapshot = Vec::new();
+                    let mut dead_ids = Vec::new();
+                    for (id, observer_ref) in &prop.observers {
+                        if let Some(observer) = observer_ref.try_call() {
+                            observers_snapshot.push(observer);
+                        } else {
+                            dead_ids.push(*id);
+                        }
+                    }
+                    
+                    (true, initial_value, current_value, observers_snapshot, dead_ids)
+                } else {
+                    (false, prop.value.clone(), prop.value.clone(), Vec::new(), Vec::new())
+                }
+            } else {
+                (false, prop.value.clone(), prop.value.clone(), Vec::new(), Vec::new())
+            }
+        };
+
+        if should_notify && !observers_snapshot.is_empty() {
+            // Notify all active observers
+            let observer_count = observers_snapshot.len();
+            for observer in observers_snapshot {
+                if let Err(e) = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+                    observer(&old_value, &new_value);
+                })) {
+                    eprintln!("Observer panic: {:?}", e);
+                }
+            }
+            
+            // Record metrics
+            let notification_time = notification_start.elapsed();
+            {
+                let mut prop = match self.inner.write() {
+                    Ok(guard) => guard,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                prop.observer_calls += observer_count;
+                prop.notification_times.push(notification_time);
+            }
+
+            // Clean up dead weak observers
+            if !dead_observer_ids.is_empty() {
+                let mut prop = match self.inner.write() {
+                    Ok(guard) => guard,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                for id in dead_observer_ids {
+                    prop.observers.remove(&id);
+                }
             }
         }
 
@@ -3357,6 +3580,8 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
                 debug_logging_enabled: false,
                 #[cfg(feature = "debug")]
                 change_logs: Vec::new(),
+                batch_depth: 0,
+                batch_initial_value: None,
             })),
             max_threads: if max_threads == 0 { MAX_THREADS } else { max_threads },
             max_observers: if max_observers == 0 { MAX_OBSERVERS } else { max_observers },
@@ -7768,6 +7993,180 @@ mod tests {
         // Count should still be 3 (no new notifications)
         assert_eq!(notification_count.load(Ordering::SeqCst), 3);
         assert_eq!(prop.get().unwrap(), 6);
+    }
+
+    #[test]
+    fn test_change_coalescing_basic() {
+        let prop = ObservableProperty::new(0);
+        let notification_count = Arc::new(AtomicUsize::new(0));
+        let last_old = Arc::new(RwLock::new(0));
+        let last_new = Arc::new(RwLock::new(0));
+
+        let count_clone = notification_count.clone();
+        let old_clone = last_old.clone();
+        let new_clone = last_new.clone();
+
+        prop.subscribe(Arc::new(move |old, new| {
+            count_clone.fetch_add(1, Ordering::SeqCst);
+            *old_clone.write().unwrap() = *old;
+            *new_clone.write().unwrap() = *new;
+        }))
+        .expect("Failed to subscribe");
+
+        // Begin batch update
+        prop.begin_update().expect("Failed to begin update");
+
+        // Multiple changes - should not trigger notifications
+        prop.set(10).expect("Failed to set value");
+        prop.set(20).expect("Failed to set value");
+        prop.set(30).expect("Failed to set value");
+
+        // No notifications yet
+        assert_eq!(notification_count.load(Ordering::SeqCst), 0);
+        assert_eq!(prop.get().unwrap(), 30);
+
+        // End batch - should trigger single notification
+        prop.end_update().expect("Failed to end update");
+
+        // Should have exactly one notification from 0 to 30
+        assert_eq!(notification_count.load(Ordering::SeqCst), 1);
+        assert_eq!(*last_old.read().unwrap(), 0);
+        assert_eq!(*last_new.read().unwrap(), 30);
+    }
+
+    #[test]
+    fn test_change_coalescing_nested() {
+        let prop = ObservableProperty::new(100);
+        let notification_count = Arc::new(AtomicUsize::new(0));
+        let count_clone = notification_count.clone();
+
+        prop.subscribe(Arc::new(move |_, _| {
+            count_clone.fetch_add(1, Ordering::SeqCst);
+        }))
+        .expect("Failed to subscribe");
+
+        // Start outer batch
+        prop.begin_update().expect("Failed to begin update");
+        prop.set(110).expect("Failed to set");
+
+        // Start inner batch
+        prop.begin_update().expect("Failed to begin nested update");
+        prop.set(120).expect("Failed to set");
+        prop.set(130).expect("Failed to set");
+        prop.end_update().expect("Failed to end nested update");
+
+        // Still no notifications (outer batch still active)
+        assert_eq!(notification_count.load(Ordering::SeqCst), 0);
+
+        prop.set(140).expect("Failed to set");
+        prop.end_update().expect("Failed to end outer update");
+
+        // Should have exactly one notification
+        assert_eq!(notification_count.load(Ordering::SeqCst), 1);
+        assert_eq!(prop.get().unwrap(), 140);
+    }
+
+    #[test]
+    fn test_change_coalescing_without_begin() {
+        let prop = ObservableProperty::new(0);
+
+        // Calling end_update without begin_update should fail
+        let result = prop.end_update();
+        assert!(result.is_err());
+
+        if let Err(PropertyError::InvalidConfiguration { reason }) = result {
+            assert!(reason.contains("without matching begin_update"));
+        } else {
+            panic!("Expected InvalidConfiguration error");
+        }
+    }
+
+    #[test]
+    fn test_change_coalescing_multiple_cycles() {
+        let prop = ObservableProperty::new(0);
+        let notification_count = Arc::new(AtomicUsize::new(0));
+        let count_clone = notification_count.clone();
+
+        prop.subscribe(Arc::new(move |_, _| {
+            count_clone.fetch_add(1, Ordering::SeqCst);
+        }))
+        .expect("Failed to subscribe");
+
+        // First batch
+        prop.begin_update().expect("Failed to begin update 1");
+        prop.set(10).expect("Failed to set");
+        prop.set(20).expect("Failed to set");
+        prop.end_update().expect("Failed to end update 1");
+
+        assert_eq!(notification_count.load(Ordering::SeqCst), 1);
+
+        // Second batch
+        prop.begin_update().expect("Failed to begin update 2");
+        prop.set(30).expect("Failed to set");
+        prop.set(40).expect("Failed to set");
+        prop.end_update().expect("Failed to end update 2");
+
+        assert_eq!(notification_count.load(Ordering::SeqCst), 2);
+
+        // Regular set (not batched)
+        prop.set(50).expect("Failed to set");
+
+        // Should trigger immediate notification
+        assert_eq!(notification_count.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn test_change_coalescing_with_async() {
+        let prop = ObservableProperty::new(0);
+        let notification_count = Arc::new(AtomicUsize::new(0));
+        let count_clone = notification_count.clone();
+
+        prop.subscribe(Arc::new(move |_, _| {
+            count_clone.fetch_add(1, Ordering::SeqCst);
+        }))
+        .expect("Failed to subscribe");
+
+        // Batched update suppresses both sync and async notifications
+        prop.begin_update().expect("Failed to begin update");
+        prop.set(10).expect("Failed to set");
+        prop.set_async(20).expect("Failed to set async");
+        prop.set(30).expect("Failed to set");
+
+        // No notifications yet
+        assert_eq!(notification_count.load(Ordering::SeqCst), 0);
+
+        prop.end_update().expect("Failed to end update");
+
+        // Should have one notification
+        assert_eq!(notification_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn test_change_coalescing_thread_safety() {
+        use std::thread;
+
+        let prop = Arc::new(ObservableProperty::new(0));
+        let notification_count = Arc::new(AtomicUsize::new(0));
+        let count_clone = notification_count.clone();
+
+        prop.subscribe(Arc::new(move |_, _| {
+            count_clone.fetch_add(1, Ordering::SeqCst);
+        }))
+        .expect("Failed to subscribe");
+
+        let prop_clone = prop.clone();
+        let handle = thread::spawn(move || {
+            prop_clone.begin_update().expect("Failed to begin update");
+            prop_clone.set(10).expect("Failed to set");
+            prop_clone.set(20).expect("Failed to set");
+            prop_clone.end_update().expect("Failed to end update");
+        });
+
+        handle.join().expect("Thread panicked");
+
+        // Should have one notification
+        assert_eq!(notification_count.load(Ordering::SeqCst), 1);
+        assert_eq!(prop.get().unwrap(), 20);
     }
 }
 
