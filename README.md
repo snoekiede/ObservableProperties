@@ -6,6 +6,7 @@
 * **Observer pattern**: Subscribe to property changes with callbacks
 * **RAII subscriptions**: Automatic cleanup with subscription guards (no manual unsubscribe needed)
 * **Filtered observers**: Only notify when specific conditions are met
+* **Computed properties**: Automatically recompute derived values when dependencies change
 * **Debouncing**: Delay notifications until changes stop for a specified duration
 * **Throttling**: Rate-limit notifications to at most once per time interval
 * **Async notifications**: Non-blocking observer notifications with background threads
@@ -208,6 +209,46 @@ fn main() -> Result<(), observable_property::PropertyError> {
         eprintln!("Failed to set temperature: {}", e);
         e
     })?; // No warning (subscription was cleaned up)
+
+    Ok(())
+}
+```
+
+### Computed Properties
+
+Computed properties automatically update when their dependencies change. Perfect for derived values:
+
+```rust
+use observable_property::{ObservableProperty, computed};
+use std::sync::Arc;
+
+fn main() -> Result<(), observable_property::PropertyError> {
+    // Create source properties
+    let width = Arc::new(ObservableProperty::new(10));
+    let height = Arc::new(ObservableProperty::new(5));
+
+    // Create computed property for area
+    let area = computed(
+        vec![width.clone(), height.clone()],
+        |values| values[0] * values[1]
+    )?;
+
+    // Subscribe to changes in the computed property
+    area.subscribe(Arc::new(|old, new| {
+        println!("Area changed from {} to {}", old, new);
+    }))?;
+
+    println!("Initial area: {}", area.get()?); // 50
+
+    // Change width - area updates automatically
+    width.set(20)?;
+    std::thread::sleep(std::time::Duration::from_millis(10));
+    println!("New area: {}", area.get()?); // 100
+
+    // Change height - area updates automatically
+    height.set(8)?;
+    std::thread::sleep(std::time::Duration::from_millis(10));
+    println!("New area: {}", area.get()?); // 160
 
     Ok(())
 }
