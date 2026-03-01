@@ -30,6 +30,7 @@ impl Person {
         self.age.get()
     }
 
+    #[allow(dead_code)]
     fn set_age(&self, new_age: i32) -> Result<(), observable_property::PropertyError> {
         self.age.set(new_age)
     }

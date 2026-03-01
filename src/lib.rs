@@ -440,6 +440,11 @@ pub enum PropertyError {
         /// Description of the issue
         reason: String,
     },
+    /// Validation failed for the provided value
+    ValidationError {
+        /// Description of why validation failed
+        reason: String,
+    },
 }
 
 impl fmt::Display for PropertyError {
@@ -474,6 +479,9 @@ impl fmt::Display for PropertyError {
             }
             PropertyError::NoHistory { reason } => {
                 write!(f, "No history available: {}", reason)
+            }
+            PropertyError::ValidationError { reason } => {
+                write!(f, "Validation failed: {}", reason)
             }
         }
     }
@@ -779,6 +787,8 @@ where
     batch_initial_value: Option<T>,
     // Custom equality function
     eq_fn: Option<Arc<dyn Fn(&T, &T) -> bool + Send + Sync>>,
+    // Validator function
+    validator: Option<Arc<dyn Fn(&T) -> Result<(), String> + Send + Sync>>,
 }
 
 /// Information about a property change with stack trace
@@ -828,6 +838,7 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
                 batch_depth: 0,
                 batch_initial_value: None,
                 eq_fn: None,
+                validator: None,
             })),
             max_threads: MAX_THREADS,
             max_observers: MAX_OBSERVERS,
@@ -963,10 +974,237 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
                 batch_depth: 0,
                 batch_initial_value: None,
                 eq_fn: Some(Arc::new(eq_fn)),
+                validator: None,
             })),
             max_threads: MAX_THREADS,
             max_observers: MAX_OBSERVERS,
         }
+    }
+
+    /// Creates a new observable property with value validation
+    ///
+    /// This constructor enables value validation for the property. Any attempt to set
+    /// a value that fails validation will be rejected with a `ValidationError`. This
+    /// ensures the property always contains valid data according to your business rules.
+    ///
+    /// The validator function is called:
+    /// - When the property is created (to validate the initial value)
+    /// - Every time `set()` or `set_async()` is called (before the value is changed)
+    /// - When `modify()` is called (after the modification function runs)
+    ///
+    /// If validation fails, the property value remains unchanged and an error is returned.
+    ///
+    /// # Arguments
+    ///
+    /// * `initial_value` - The starting value for this property (must pass validation)
+    /// * `validator` - A function that validates values, returning `Ok(())` for valid values
+    ///                 or `Err(String)` with an error message for invalid values
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(Self)` - If the initial value passes validation
+    /// * `Err(PropertyError::ValidationError)` - If the initial value fails validation
+    ///
+    /// # Use Cases
+    ///
+    /// ## Age Validation
+    ///
+    /// ```rust
+    /// use observable_property::ObservableProperty;
+    /// use std::sync::Arc;
+    ///
+    /// # fn main() -> Result<(), observable_property::PropertyError> {
+    /// // Only allow ages between 0 and 150
+    /// let age = ObservableProperty::with_validator(
+    ///     25,
+    ///     |age| {
+    ///         if *age <= 150 {
+    ///             Ok(())
+    ///         } else {
+    ///             Err(format!("Age must be between 0 and 150, got {}", age))
+    ///         }
+    ///     }
+    /// )?;
+    ///
+    /// let _sub = age.subscribe_with_subscription(Arc::new(|old, new| {
+    ///     println!("Age changed: {} -> {}", old, new);
+    /// }))?;
+    ///
+    /// age.set(30)?;  // ✓ Valid - prints: "Age changed: 25 -> 30"
+    ///
+    /// // Attempt to set invalid age
+///     match age.set(200) {
+///         Err(e) => println!("Validation failed: {}", e), // Prints validation error
+    ///         Ok(_) => unreachable!(),
+    ///     }
+    ///
+    /// assert_eq!(age.get()?, 30); // Value unchanged after failed validation
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// ## Email Format Validation
+    ///
+    /// ```rust
+    /// use observable_property::ObservableProperty;
+    ///
+    /// # fn main() -> Result<(), observable_property::PropertyError> {
+    /// // Validate email format (simplified)
+    /// let email = ObservableProperty::with_validator(
+    ///     "user@example.com".to_string(),
+    ///     |email| {
+    ///         if email.contains('@') && email.contains('.') {
+    ///             Ok(())
+    ///         } else {
+    ///             Err(format!("Invalid email format: {}", email))
+    ///         }
+    ///     }
+    /// )?;
+    ///
+    /// email.set("valid@email.com".to_string())?;  // ✓ Valid
+    ///
+    /// match email.set("invalid-email".to_string()) {
+    ///     Err(e) => println!("{}", e), // Prints: "Validation failed: Invalid email format: invalid-email"
+    ///     Ok(_) => unreachable!(),
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// ## Range Validation for Floats
+    ///
+    /// ```rust
+    /// use observable_property::ObservableProperty;
+    ///
+    /// # fn main() -> Result<(), observable_property::PropertyError> {
+    /// // Temperature must be between absolute zero and practical maximum
+    /// let temperature = ObservableProperty::with_validator(
+    ///     20.0_f64,
+    ///     |temp| {
+    ///         if *temp >= -273.15 && *temp <= 1000.0 {
+    ///             Ok(())
+    ///         } else {
+    ///             Err(format!("Temperature {} is out of valid range [-273.15, 1000.0]", temp))
+    ///         }
+    ///     }
+    /// )?;
+    ///
+    /// temperature.set(100.0)?;   // ✓ Valid
+    /// temperature.set(-300.0).unwrap_err();  // ✗ Fails validation
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// ## Multiple Validation Rules
+    ///
+    /// ```rust
+    /// use observable_property::ObservableProperty;
+    ///
+    /// # fn main() -> Result<(), observable_property::PropertyError> {
+    /// // Username validation with multiple rules
+    /// let username = ObservableProperty::with_validator(
+    ///     "alice".to_string(),
+    ///     |name| {
+    ///         if name.is_empty() {
+    ///             return Err("Username cannot be empty".to_string());
+    ///         }
+    ///         if name.len() < 3 {
+    ///             return Err(format!("Username must be at least 3 characters, got {}", name.len()));
+    ///         }
+    ///         if name.len() > 20 {
+    ///             return Err(format!("Username must be at most 20 characters, got {}", name.len()));
+    ///         }
+    ///         if !name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+    ///             return Err("Username can only contain letters, numbers, and underscores".to_string());
+    ///         }
+    ///         Ok(())
+    ///     }
+    /// )?;
+    ///
+    /// username.set("bob".to_string())?;      // ✓ Valid
+    /// username.set("ab".to_string()).unwrap_err();   // ✗ Too short
+    /// username.set("user@123".to_string()).unwrap_err(); // ✗ Invalid characters
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// ## Rejecting Invalid Initial Values
+    ///
+    /// ```rust
+    /// use observable_property::ObservableProperty;
+    ///
+    /// # fn main() {
+    /// // Attempt to create with invalid initial value
+    /// let result = ObservableProperty::with_validator(
+    ///     200,
+    ///     |age| {
+    ///         if *age <= 150 {
+    ///             Ok(())
+    ///         } else {
+    ///             Err(format!("Age must be at most 150, got {}", age))
+    ///         }
+    ///     }
+    /// );
+    ///
+    /// match result {
+    ///     Err(e) => println!("Failed to create property: {}", e),
+    ///     Ok(_) => unreachable!(),
+    /// }
+    /// # }
+    /// ```
+    ///
+    /// # Performance Considerations
+    ///
+    /// The validator function is called on every `set()` or `set_async()` operation,
+    /// so it should be relatively fast. For expensive validations, consider:
+    /// - Caching validation results if the same value is set multiple times
+    /// - Using async validation patterns outside of the property setter
+    /// - Implementing early-exit validation logic (check cheapest rules first)
+    ///
+    /// # Thread Safety
+    ///
+    /// The validator function must be `Send + Sync + 'static` as it may be called from
+    /// any thread that modifies the property. Ensure your validation logic is thread-safe.
+    ///
+    /// # Combining with Other Features
+    ///
+    /// Validation works alongside other property features:
+    /// - **Custom equality**: Validation runs before equality checking
+    /// - **History tracking**: Only valid values are stored in history
+    /// - **Observers**: Observers only fire when validation succeeds and values differ
+    /// - **Batching**: Validation occurs when batch is committed, not during batch
+    pub fn with_validator<F>(
+        initial_value: T,
+        validator: F,
+    ) -> Result<Self, PropertyError>
+    where
+        F: Fn(&T) -> Result<(), String> + Send + Sync + 'static,
+    {
+        // Validate the initial value
+        validator(&initial_value).map_err(|reason| PropertyError::ValidationError { reason })?;
+
+        Ok(Self {
+            inner: Arc::new(RwLock::new(InnerProperty {
+                value: initial_value,
+                observers: HashMap::new(),
+                next_id: 0,
+                history: None,
+                history_size: 0,
+                total_changes: 0,
+                observer_calls: 0,
+                notification_times: Vec::new(),
+                #[cfg(feature = "debug")]
+                debug_logging_enabled: false,
+                #[cfg(feature = "debug")]
+                change_logs: Vec::new(),
+                batch_depth: 0,
+                batch_initial_value: None,
+                eq_fn: None,
+                validator: Some(Arc::new(validator)),
+            })),
+            max_threads: MAX_THREADS,
+            max_observers: MAX_OBSERVERS,
+        })
     }
 
     /// Creates a new observable property with a custom maximum thread count for async notifications
@@ -1067,6 +1305,7 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
                 batch_depth: 0,
                 batch_initial_value: None,
                 eq_fn: None,
+                validator: None,
             })),
             max_threads,
             max_observers: MAX_OBSERVERS,
@@ -1386,6 +1625,7 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
                 batch_depth: 0,
                 batch_initial_value: None,
                 eq_fn: None,
+                validator: None,
             })),
             max_threads: MAX_THREADS,
             max_observers: MAX_OBSERVERS,
@@ -1535,6 +1775,9 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
                 Err(poisoned) => poisoned.into_inner(),
             };
 
+            // Clone the validator Arc before working with history to avoid borrow conflicts
+            let validator = prop.validator.clone();
+
             // Check if history is enabled and has values
             let history = prop.history.as_mut().ok_or_else(|| PropertyError::NoHistory {
                 reason: "History tracking is not enabled for this property".to_string(),
@@ -1548,6 +1791,19 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
 
             // Pop the most recent historical value
             let previous_value = history.pop().unwrap();
+            
+            // Validate the historical value if a validator is configured
+            // This ensures consistency if validation rules have changed since the value was stored
+            if let Some(validator) = validator {
+                validator(&previous_value).map_err(|reason| {
+                    // Put the value back in history if validation fails
+                    history.push(previous_value.clone());
+                    PropertyError::ValidationError { 
+                        reason: format!("Cannot undo to invalid historical value: {}", reason)
+                    }
+                })?;
+            }
+            
             let old_value = mem::replace(&mut prop.value, previous_value.clone());
 
             // Debug logging (requires T: std::fmt::Debug when debug feature is enabled)
@@ -1888,6 +2144,18 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
     /// # Ok::<(), observable_property::PropertyError>(())
     /// ```
     pub fn set(&self, new_value: T) -> Result<(), PropertyError> {
+        // Validate the new value if a validator is configured
+        {
+            let prop = match self.inner.read() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            
+            if let Some(validator) = &prop.validator {
+                validator(&new_value).map_err(|reason| PropertyError::ValidationError { reason })?;
+            }
+        }
+
         let notification_start = Instant::now();
         let (old_value, observers_snapshot, dead_observer_ids, in_batch) = {
             let mut prop = match self.inner.write() {
@@ -2120,6 +2388,18 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
     /// # }
     /// ```
     pub fn set_async(&self, new_value: T) -> Result<(), PropertyError> {
+        // Validate the new value if a validator is configured
+        {
+            let prop = match self.inner.read() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            
+            if let Some(validator) = &prop.validator {
+                validator(&new_value).map_err(|reason| PropertyError::ValidationError { reason })?;
+            }
+        }
+
         let notification_start = Instant::now();
         let (old_value, observers_snapshot, dead_observer_ids, in_batch) = {
             let mut prop = match self.inner.write() {
@@ -3747,6 +4027,7 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
                 batch_depth: 0,
                 batch_initial_value: None,
                 eq_fn: None,
+                validator: None,
             })),
             max_threads: if max_threads == 0 { MAX_THREADS } else { max_threads },
             max_observers: if max_observers == 0 { MAX_OBSERVERS } else { max_observers },
@@ -3867,6 +4148,15 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
             let old_value = prop.value.clone();
             f(&mut prop.value);
             let new_value = prop.value.clone();
+            
+            // Validate the modified value if a validator is configured
+            if let Some(validator) = &prop.validator {
+                validator(&new_value).map_err(|reason| {
+                    // Restore the old value if validation fails
+                    prop.value = old_value.clone();
+                    PropertyError::ValidationError { reason }
+                })?;
+            }
             
             // Check if values are equal using custom equality function if provided
             let values_equal = if let Some(eq_fn) = &prop.eq_fn {
