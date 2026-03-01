@@ -236,6 +236,9 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
+
 /// Maximum number of background threads used for asynchronous observer notifications
 ///
 /// This constant controls the degree of parallelism when using `set_async()` to notify
@@ -311,6 +314,59 @@ const MAX_THREADS: usize = 4;
 /// - **Monitoring system**: 100 metrics, each with 20 dashboard widgets = ~2,000 observers
 const MAX_OBSERVERS: usize = 10_000;
 
+/// Trait for implementing property value persistence
+///
+/// This trait allows custom persistence strategies for ObservableProperty values,
+/// enabling automatic save/load functionality to various storage backends like
+/// disk files, databases, cloud storage, etc.
+///
+/// # Examples
+///
+/// ```rust
+/// use observable_property::PropertyPersistence;
+/// use std::fs;
+///
+/// struct FilePersistence {
+///     path: String,
+/// }
+///
+/// impl PropertyPersistence for FilePersistence {
+///     type Value = String;
+///
+///     fn load(&self) -> Result<Self::Value, Box<dyn std::error::Error + Send + Sync>> {
+///         fs::read_to_string(&self.path)
+///             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+///     }
+///
+///     fn save(&self, value: &Self::Value) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+///         fs::write(&self.path, value)
+///             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+///     }
+/// }
+/// ```
+pub trait PropertyPersistence: Send + Sync + 'static {
+    /// The type of value being persisted
+    type Value: Clone + Send + Sync + 'static;
+
+    /// Load the value from persistent storage
+    ///
+    /// # Returns
+    ///
+    /// Returns the loaded value or an error if loading fails
+    fn load(&self) -> Result<Self::Value, Box<dyn std::error::Error + Send + Sync>>;
+
+    /// Save the value to persistent storage
+    ///
+    /// # Arguments
+    ///
+    /// * `value` - The value to persist
+    ///
+    /// # Returns
+    ///
+    /// Returns `Ok(())` if successful, or an error if saving fails
+    fn save(&self, value: &Self::Value) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+}
+
 /// Errors that can occur when working with ObservableProperty
 ///
 /// # Note on Lock Poisoning
@@ -371,6 +427,11 @@ pub enum PropertyError {
         /// Description of the invalid configuration
         reason: String,
     },
+    /// Failed to persist the property value
+    PersistenceError {
+        /// Description of the persistence error
+        reason: String,
+    },
 }
 
 impl fmt::Display for PropertyError {
@@ -399,6 +460,9 @@ impl fmt::Display for PropertyError {
             }
             PropertyError::InvalidConfiguration { reason } => {
                 write!(f, "Invalid configuration: {}", reason)
+            }
+            PropertyError::PersistenceError { reason } => {
+                write!(f, "Persistence failed: {}", reason)
             }
         }
     }
@@ -741,6 +805,171 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
             max_threads,
             max_observers: MAX_OBSERVERS,
         }
+    }
+
+    /// Creates a new observable property with automatic persistence
+    ///
+    /// This constructor creates a property that automatically saves its value to persistent
+    /// storage whenever it changes. It attempts to load the initial value from storage, falling
+    /// back to the provided `initial_value` if loading fails.
+    ///
+    /// # Arguments
+    ///
+    /// * `initial_value` - The value to use if loading from persistence fails
+    /// * `persistence` - An implementation of `PropertyPersistence` that handles save/load operations
+    ///
+    /// # Behavior
+    ///
+    /// 1. Attempts to load the initial value from `persistence.load()`
+    /// 2. If loading fails, uses the provided `initial_value`
+    /// 3. Sets up an internal observer that automatically calls `persistence.save()` on every value change
+    /// 4. Returns the configured property
+    ///
+    /// # Error Handling
+    ///
+    /// - Load failures are logged and the provided `initial_value` is used instead
+    /// - Save failures during subsequent updates will be logged but won't prevent the update
+    /// - The property continues to operate normally even if persistence operations fail
+    ///
+    /// # Type Requirements
+    ///
+    /// The persistence handler's `Value` type must match the property's type `T`.
+    ///
+    /// # Examples
+    ///
+    /// ## File-based Persistence
+    ///
+    /// ```rust,no_run
+    /// use observable_property::{ObservableProperty, PropertyPersistence};
+    /// use std::fs;
+    ///
+    /// struct FilePersistence {
+    ///     path: String,
+    /// }
+    ///
+    /// impl PropertyPersistence for FilePersistence {
+    ///     type Value = String;
+    ///
+    ///     fn load(&self) -> Result<Self::Value, Box<dyn std::error::Error + Send + Sync>> {
+    ///         fs::read_to_string(&self.path)
+    ///             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+    ///     }
+    ///
+    ///     fn save(&self, value: &Self::Value) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    ///         fs::write(&self.path, value)
+    ///             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+    ///     }
+    /// }
+    ///
+    /// // Create a property that auto-saves to a file
+    /// let property = ObservableProperty::with_persistence(
+    ///     "default_value".to_string(),
+    ///     FilePersistence { path: "./data.txt".to_string() }
+    /// );
+    ///
+    /// // Value changes are automatically saved to disk
+    /// property.set("new_value".to_string())
+    ///     .expect("Failed to set value");
+    /// ```
+    ///
+    /// ## JSON Database Persistence
+    ///
+    /// ```rust,no_run
+    /// # // This example requires serde and serde_json dependencies
+    /// use observable_property::{ObservableProperty, PropertyPersistence};
+    /// # /*
+    /// use serde::{Serialize, Deserialize};
+    /// # */
+    /// use std::fs;
+    ///
+    /// # /*
+    /// #[derive(Clone, Serialize, Deserialize)]
+    /// # */
+    /// # #[derive(Clone)]
+    /// struct UserPreferences {
+    ///     theme: String,
+    ///     font_size: u32,
+    /// }
+    ///
+    /// struct JsonPersistence {
+    ///     path: String,
+    /// }
+    ///
+    /// impl PropertyPersistence for JsonPersistence {
+    ///     type Value = UserPreferences;
+    ///
+    ///     fn load(&self) -> Result<Self::Value, Box<dyn std::error::Error + Send + Sync>> {
+    ///         # /*
+    ///         let data = fs::read_to_string(&self.path)?;
+    ///         let prefs = serde_json::from_str(&data)?;
+    ///         Ok(prefs)
+    ///         # */
+    ///         # Ok(UserPreferences { theme: "dark".to_string(), font_size: 14 })
+    ///     }
+    ///
+    ///     fn save(&self, value: &Self::Value) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    ///         # /*
+    ///         let data = serde_json::to_string_pretty(value)?;
+    ///         fs::write(&self.path, data)?;
+    ///         # */
+    ///         Ok(())
+    ///     }
+    /// }
+    ///
+    /// let default_prefs = UserPreferences {
+    ///     theme: "dark".to_string(),
+    ///     font_size: 14,
+    /// };
+    ///
+    /// let prefs = ObservableProperty::with_persistence(
+    ///     default_prefs,
+    ///     JsonPersistence { path: "./preferences.json".to_string() }
+    /// );
+    ///
+    /// // Changes are auto-saved as JSON
+    /// prefs.modify(|p| {
+    ///     p.theme = "light".to_string();
+    ///     p.font_size = 16;
+    /// }).expect("Failed to update preferences");
+    /// ```
+    ///
+    /// # Thread Safety
+    ///
+    /// The persistence handler must be `Send + Sync + 'static` since save operations
+    /// may be called from any thread holding a reference to the property.
+    ///
+    /// # Performance Considerations
+    ///
+    /// - Persistence operations are called synchronously on every value change
+    /// - Use fast storage backends or consider debouncing frequent updates
+    /// - For high-frequency updates, consider implementing a buffered persistence strategy
+    pub fn with_persistence<P>(initial_value: T, persistence: P) -> Self
+    where
+        P: PropertyPersistence<Value = T>,
+    {
+        // Try to load from persistence, fall back to initial_value on error
+        let value = persistence.load().unwrap_or_else(|e| {
+            eprintln!(
+                "Failed to load persisted value, using initial value: {}",
+                e
+            );
+            initial_value.clone()
+        });
+
+        // Create the property with the loaded or default value
+        let property = Self::new(value);
+
+        // Set up auto-save observer
+        let persistence = Arc::new(persistence);
+        if let Err(e) = property.subscribe(Arc::new(move |_old, new| {
+            if let Err(save_err) = persistence.save(new) {
+                eprintln!("Failed to persist property value: {}", save_err);
+            }
+        })) {
+            eprintln!("Failed to subscribe persistence observer: {}", e);
+        }
+
+        property
     }
 
     /// Gets the current value of the property
@@ -2344,6 +2573,69 @@ impl<T: Clone + std::fmt::Debug + Send + Sync + 'static> std::fmt::Debug for Obs
                 .field("max_observers", &self.max_observers)
                 .finish(),
         }
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<T: Clone + Send + Sync + 'static + Serialize> Serialize for ObservableProperty<T> {
+    /// Serializes only the current value of the property, not the observers
+    ///
+    /// # Note
+    ///
+    /// This serialization only captures the current value. Observer subscriptions
+    /// and internal state are not serialized, as they contain function pointers
+    /// and runtime state that cannot be meaningfully serialized.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # #[cfg(feature = "serde")] {
+    /// use observable_property::ObservableProperty;
+    /// use serde_json;
+    ///
+    /// let property = ObservableProperty::new(42);
+    /// let json = serde_json::to_string(&property).unwrap();
+    /// assert_eq!(json, "42");
+    /// # }
+    /// ```
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self.get() {
+            Ok(value) => value.serialize(serializer),
+            Err(_) => Err(serde::ser::Error::custom("Failed to read property value")),
+        }
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<'de, T: Clone + Send + Sync + 'static + Deserialize<'de>> Deserialize<'de> for ObservableProperty<T> {
+    /// Deserializes a value and creates a new ObservableProperty with no observers
+    ///
+    /// # Note
+    ///
+    /// The deserialized property will have no observers. You'll need to
+    /// re-establish any subscriptions after deserialization.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # #[cfg(feature = "serde")] {
+    /// use observable_property::ObservableProperty;
+    /// use serde_json;
+    ///
+    /// let json = "42";
+    /// let property: ObservableProperty<i32> = serde_json::from_str(json).unwrap();
+    /// assert_eq!(property.get().unwrap(), 42);
+    /// # }
+    /// ```
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = T::deserialize(deserializer)?;
+        Ok(ObservableProperty::new(value))
     }
 }
 
