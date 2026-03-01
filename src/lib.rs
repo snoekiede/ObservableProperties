@@ -777,6 +777,8 @@ where
     // Change coalescing
     batch_depth: usize,
     batch_initial_value: Option<T>,
+    // Custom equality function
+    eq_fn: Option<Arc<dyn Fn(&T, &T) -> bool + Send + Sync>>,
 }
 
 /// Information about a property change with stack trace
@@ -825,6 +827,142 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
                 change_logs: Vec::new(),
                 batch_depth: 0,
                 batch_initial_value: None,
+                eq_fn: None,
+            })),
+            max_threads: MAX_THREADS,
+            max_observers: MAX_OBSERVERS,
+        }
+    }
+
+    /// Creates a new observable property with custom equality comparison
+    ///
+    /// This constructor allows you to define custom logic for determining when two values
+    /// are considered "equal". Observers are only notified when the equality function
+    /// returns `false` (i.e., when the values are considered different).
+    ///
+    /// This is particularly useful for:
+    /// - Float comparisons with epsilon tolerance (avoiding floating-point precision issues)
+    /// - Case-insensitive string comparisons
+    /// - Semantic equality that differs from structural equality
+    /// - Preventing spurious notifications for "equal enough" values
+    ///
+    /// # Arguments
+    ///
+    /// * `initial_value` - The starting value for this property
+    /// * `eq_fn` - A function that returns `true` if two values should be considered equal,
+    ///             `false` if they should be considered different (which triggers notifications)
+    ///
+    /// # Examples
+    ///
+    /// ## Float comparison with epsilon
+    ///
+    /// ```rust
+    /// use observable_property::ObservableProperty;
+    /// use std::sync::Arc;
+    ///
+    /// # fn main() -> Result<(), observable_property::PropertyError> {
+    /// // Create a property that only notifies if the difference is > 0.001
+    /// let temperature = ObservableProperty::with_equality(
+    ///     20.0_f64,
+    ///     |a, b| (a - b).abs() < 0.001
+    /// );
+    ///
+    /// let _sub = temperature.subscribe_with_subscription(Arc::new(|old, new| {
+    ///     println!("Significant temperature change: {} -> {}", old, new);
+    /// }))?;
+    ///
+    /// temperature.set(20.0005)?;  // No notification (within epsilon)
+    /// temperature.set(20.5)?;     // Notification triggered
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// ## Case-insensitive string comparison
+    ///
+    /// ```rust
+    /// use observable_property::ObservableProperty;
+    /// use std::sync::Arc;
+    ///
+    /// # fn main() -> Result<(), observable_property::PropertyError> {
+    /// // Only notify on case-insensitive changes
+    /// let username = ObservableProperty::with_equality(
+    ///     "Alice".to_string(),
+    ///     |a, b| a.to_lowercase() == b.to_lowercase()
+    /// );
+    ///
+    /// let _sub = username.subscribe_with_subscription(Arc::new(|old, new| {
+    ///     println!("Username changed: {} -> {}", old, new);
+    /// }))?;
+    ///
+    /// username.set("alice".to_string())?;  // No notification
+    /// username.set("ALICE".to_string())?;  // No notification
+    /// username.set("Bob".to_string())?;    // Notification triggered
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// ## Semantic equality for complex types
+    ///
+    /// ```rust
+    /// use observable_property::ObservableProperty;
+    /// use std::sync::Arc;
+    ///
+    /// # fn main() -> Result<(), observable_property::PropertyError> {
+    /// #[derive(Clone)]
+    /// struct Config {
+    ///     host: String,
+    ///     port: u16,
+    ///     timeout_ms: u64,
+    /// }
+    ///
+    /// // Only notify if critical fields change
+    /// let config = ObservableProperty::with_equality(
+    ///     Config { host: "localhost".to_string(), port: 8080, timeout_ms: 1000 },
+    ///     |a, b| a.host == b.host && a.port == b.port  // Ignore timeout changes
+    /// );
+    ///
+    /// let _sub = config.subscribe_with_subscription(Arc::new(|old, new| {
+    ///     println!("Critical config changed: {}:{} -> {}:{}",
+    ///         old.host, old.port, new.host, new.port);
+    /// }))?;
+    ///
+    /// config.modify(|c| c.timeout_ms = 2000)?;  // No notification (timeout ignored)
+    /// config.modify(|c| c.port = 9090)?;        // Notification triggered
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Performance Considerations
+    ///
+    /// The equality function is called every time `set()` or `set_async()` is called,
+    /// so it should be relatively fast. For expensive comparisons, consider using
+    /// filtered observers instead.
+    ///
+    /// # Thread Safety
+    ///
+    /// The equality function must be `Send + Sync + 'static` as it may be called from
+    /// any thread that modifies the property.
+    pub fn with_equality<F>(initial_value: T, eq_fn: F) -> Self
+    where
+        F: Fn(&T, &T) -> bool + Send + Sync + 'static,
+    {
+        Self {
+            inner: Arc::new(RwLock::new(InnerProperty {
+                value: initial_value,
+                observers: HashMap::new(),
+                next_id: 0,
+                history: None,
+                history_size: 0,
+                total_changes: 0,
+                observer_calls: 0,
+                notification_times: Vec::new(),
+                #[cfg(feature = "debug")]
+                debug_logging_enabled: false,
+                #[cfg(feature = "debug")]
+                change_logs: Vec::new(),
+                batch_depth: 0,
+                batch_initial_value: None,
+                eq_fn: Some(Arc::new(eq_fn)),
             })),
             max_threads: MAX_THREADS,
             max_observers: MAX_OBSERVERS,
@@ -928,6 +1066,7 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
                 change_logs: Vec::new(),
                 batch_depth: 0,
                 batch_initial_value: None,
+                eq_fn: None,
             })),
             max_threads,
             max_observers: MAX_OBSERVERS,
@@ -1246,6 +1385,7 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
                 change_logs: Vec::new(),
                 batch_depth: 0,
                 batch_initial_value: None,
+                eq_fn: None,
             })),
             max_threads: MAX_THREADS,
             max_observers: MAX_OBSERVERS,
@@ -1759,6 +1899,18 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
                 }
             };
 
+            // Check if values are equal using custom equality function if provided
+            let values_equal = if let Some(eq_fn) = &prop.eq_fn {
+                eq_fn(&prop.value, &new_value)
+            } else {
+                false  // No equality function = always notify
+            };
+
+            // If values are equal, skip everything
+            if values_equal {
+                return Ok(());
+            }
+
             // Check if we're in a batch update
             let in_batch = prop.batch_depth > 0;
 
@@ -1977,6 +2129,18 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
                     poisoned.into_inner()
                 }
             };
+
+            // Check if values are equal using custom equality function if provided
+            let values_equal = if let Some(eq_fn) = &prop.eq_fn {
+                eq_fn(&prop.value, &new_value)
+            } else {
+                false  // No equality function = always notify
+            };
+
+            // If values are equal, skip everything
+            if values_equal {
+                return Ok(());
+            }
 
             // Check if we're in a batch update
             let in_batch = prop.batch_depth > 0;
@@ -3582,6 +3746,7 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
                 change_logs: Vec::new(),
                 batch_depth: 0,
                 batch_initial_value: None,
+                eq_fn: None,
             })),
             max_threads: if max_threads == 0 { MAX_THREADS } else { max_threads },
             max_observers: if max_observers == 0 { MAX_OBSERVERS } else { max_observers },
@@ -3702,6 +3867,18 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
             let old_value = prop.value.clone();
             f(&mut prop.value);
             let new_value = prop.value.clone();
+            
+            // Check if values are equal using custom equality function if provided
+            let values_equal = if let Some(eq_fn) = &prop.eq_fn {
+                eq_fn(&old_value, &new_value)
+            } else {
+                false  // No equality function = always notify
+            };
+
+            // If values are equal, skip everything
+            if values_equal {
+                return Ok(());
+            }
             
             // Add old value to history if history tracking is enabled
             let history_size = prop.history_size;
