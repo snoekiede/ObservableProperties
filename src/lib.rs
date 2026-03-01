@@ -242,6 +242,12 @@ use serde::{Deserialize, Serialize};
 #[cfg(feature = "debug")]
 use backtrace::Backtrace;
 
+#[cfg(feature = "async")]
+use std::pin::Pin;
+
+#[cfg(feature = "async")]
+use std::task::{Context, Poll};
+
 /// Maximum number of background threads used for asynchronous observer notifications
 ///
 /// This constant controls the degree of parallelism when using `set_async()` to notify
@@ -713,6 +719,29 @@ impl<T: Clone + Send + Sync + 'static> Drop for Subscription<T> {
             }
         }
     }
+}
+
+/// A custom Stream trait for async iteration over values
+///
+/// This trait provides a simple async iteration interface similar to the standard
+/// `futures::Stream` trait, but implemented using only standard library primitives.
+///
+/// # Note
+///
+/// This is a custom trait and is not compatible with the futures ecosystem's
+/// `Stream` trait. For ecosystem compatibility, consider using the futures-core crate.
+#[cfg(feature = "async")]
+pub trait Stream {
+    /// The type of items yielded by this stream
+    type Item;
+
+    /// Attempts to pull out the next value of this stream
+    ///
+    /// Returns:
+    /// - `Poll::Ready(Some(item))` if a value is ready
+    /// - `Poll::Pending` if no value is ready yet (will wake the task later)
+    /// - `Poll::Ready(None)` if the stream has ended
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>>;
 }
 
 /// A thread-safe observable property that notifies observers when its value changes
@@ -4965,6 +4994,359 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
         }))?;
 
         Ok(())
+    }
+
+    /// Converts the observable property to an async stream
+    ///
+    /// Creates a stream that yields the current value followed by all future values
+    /// as the property changes. The stream will continue indefinitely until dropped.
+    ///
+    /// # Features
+    ///
+    /// This method requires the `async` feature to be enabled.
+    ///
+    /// # Returns
+    ///
+    /// Returns a `PropertyStream<T>` that yields cloned values whenever
+    /// the property changes.
+    ///
+    /// # Note
+    ///
+    /// This implementation uses only standard library primitives and does not
+    /// depend on external async runtimes. The custom `Stream` trait is not
+    /// compatible with the futures ecosystem.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use observable_property::{ObservableProperty, Stream};
+    /// use std::sync::Arc;
+    /// use std::pin::Pin;
+    ///
+    /// async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    ///     let property = Arc::new(ObservableProperty::new(0));
+    ///     let mut stream = Box::pin(property.to_stream());
+    ///
+    ///     // Spawn a thread to modify the property
+    ///     let prop_clone = property.clone();
+    ///     std::thread::spawn(move || {
+    ///         std::thread::sleep(std::time::Duration::from_millis(100));
+    ///         prop_clone.set(42).ok();
+    ///         std::thread::sleep(std::time::Duration::from_millis(100));
+    ///         prop_clone.set(100).ok();
+    ///     });
+    ///
+    ///     // Manual polling (you'd typically use an async runtime for this)
+    ///     // This is just for demonstration
+    ///     Ok(())
+    /// }
+    /// ```
+    #[cfg(feature = "async")]
+    pub fn to_stream(&self) -> PropertyStream<T> {
+        use std::sync::mpsc;
+        
+        let (tx, rx) = mpsc::channel::<T>();
+        let inner = self.inner.clone();
+
+        // Get the current value to send as the first item
+        let current_value = inner
+            .read()
+            .or_else(|poisoned| Ok::<_, ()>(poisoned.into_inner()))
+            .map(|prop| prop.value.clone())
+            .ok();
+
+        // Subscribe to changes and send them to the channel
+        let subscription_id = self
+            .subscribe(Arc::new(move |_old, new| {
+                let _ = tx.send(new.clone());
+            }))
+            .ok();
+
+        PropertyStream {
+            rx,
+            current_value,
+            subscription_id,
+            property: self.inner.clone(),
+            waker: Arc::new(Mutex::new(None)),
+        }
+    }
+}
+
+/// A stream that yields values from an ObservableProperty
+///
+/// This stream implementation uses only standard library primitives and
+/// provides a simple async iteration interface.
+#[cfg(feature = "async")]
+pub struct PropertyStream<T>
+where
+    T: Clone + Send + Sync + 'static,
+{
+    rx: std::sync::mpsc::Receiver<T>,
+    current_value: Option<T>,
+    subscription_id: Option<ObserverId>,
+    property: Arc<RwLock<InnerProperty<T>>>,
+    waker: Arc<Mutex<Option<std::task::Waker>>>,
+}
+
+#[cfg(feature = "async")]
+impl<T: Clone + Send + Sync + Unpin + 'static> Stream for PropertyStream<T> {
+    type Item = T;
+
+    fn poll_next(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Self::Item>> {
+        // Get mutable access to self
+        let this = self.get_mut();
+
+        // First, yield the current value if we haven't yet
+        if let Some(value) = this.current_value.take() {
+            return Poll::Ready(Some(value));
+        }
+
+        // Try to receive a value from the channel without blocking
+        match this.rx.try_recv() {
+            Ok(value) => Poll::Ready(Some(value)),
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                // Store the waker so the observer can wake us up
+                if let Ok(mut waker_lock) = this.waker.lock() {
+                    *waker_lock = Some(cx.waker().clone());
+                }
+                Poll::Pending
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => Poll::Ready(None),
+        }
+    }
+}
+
+#[cfg(feature = "async")]
+impl<T: Clone + Send + Sync + 'static> Drop for PropertyStream<T> {
+    fn drop(&mut self) {
+        // Clean up subscription when stream is dropped
+        if let Some(id) = self.subscription_id {
+            if let Ok(mut prop) = self.property.write().or_else(|poisoned| Ok::<_, ()>(poisoned.into_inner())) {
+                prop.observers.remove(&id);
+            }
+        }
+    }
+}
+
+#[cfg(feature = "async")]
+impl<T: Clone + Send + Sync + Unpin + 'static> ObservableProperty<T> {
+    /// Asynchronously waits for a specific condition to be met
+    ///
+    /// This method will await until the predicate function returns `true` for
+    /// the property value. It checks the current value immediately, and if the
+    /// predicate is not satisfied, it subscribes to changes and waits.
+    ///
+    /// # Features
+    ///
+    /// This method requires the `async` feature to be enabled.
+    ///
+    /// # Arguments
+    ///
+    /// * `predicate` - A function that tests whether the condition is met
+    ///
+    /// # Returns
+    ///
+    /// Returns the first value that satisfies the predicate.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use observable_property::ObservableProperty;
+    /// use std::sync::Arc;
+    ///
+    /// #[tokio::main]
+    /// async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    ///     let property = Arc::new(ObservableProperty::new(0));
+    ///
+    ///     // Spawn a task to modify the property after a delay
+    ///     let prop_clone = property.clone();
+    ///     tokio::spawn(async move {
+    ///         for i in 1..=10 {
+    ///             tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    ///             prop_clone.set(i).ok();
+    ///         }
+    ///     });
+    ///
+    ///     // Wait for the property to reach a specific value
+    ///     let result = property.wait_for(|value| *value >= 5).await;
+    ///     println!("Property reached: {}", result);
+    ///     assert!(result >= 5);
+    ///
+    ///     Ok(())
+    /// }
+    /// ```
+    ///
+    /// # Advanced Example: Multiple Conditions
+    ///
+    /// ```rust,no_run
+    /// use observable_property::ObservableProperty;
+    /// use std::sync::Arc;
+    ///
+    /// async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    ///     let temperature = Arc::new(ObservableProperty::new(20.0));
+    ///
+    ///     // Spawn a thread to simulate temperature changes
+    ///     let temp_clone = temperature.clone();
+    ///     std::thread::spawn(move || {
+    ///         for i in 0..20 {
+    ///             std::thread::sleep(std::time::Duration::from_millis(50));
+    ///             temp_clone.set(20.0 + i as f64 * 0.5).ok();
+    ///         }
+    ///     });
+    ///
+    ///     // Wait for critical temperature
+    ///     let critical = temperature.wait_for(|temp| *temp > 25.0).await;
+    ///     println!("Critical temperature reached: {:.1}°C", critical);
+    ///
+    ///     Ok(())
+    /// }
+    /// ```
+    #[cfg(feature = "async")]
+    pub fn wait_for<F>(&self, predicate: F) -> WaitForFuture<T, F>
+    where
+        F: Fn(&T) -> bool + Send + Sync + Unpin + 'static,
+    {
+        WaitForFuture::new(self.inner.clone(), predicate, self)
+    }
+}
+
+/// A Future that resolves when an ObservableProperty meets a specific condition
+#[cfg(feature = "async")]
+pub struct WaitForFuture<T, F>
+where
+    T: Clone + Send + Sync + Unpin + 'static,
+    F: Fn(&T) -> bool + Send + Sync + Unpin + 'static,
+{
+    property: Arc<RwLock<InnerProperty<T>>>,
+    rx: std::sync::mpsc::Receiver<T>,
+    subscription_id: Option<ObserverId>,
+    result: Option<T>,
+    _phantom: std::marker::PhantomData<F>,
+}
+
+#[cfg(feature = "async")]
+impl<T, F> WaitForFuture<T, F>
+where
+    T: Clone + Send + Sync + Unpin + 'static,
+    F: Fn(&T) -> bool + Send + Sync + Unpin + 'static,
+{
+    fn new<P>(property: Arc<RwLock<InnerProperty<T>>>, predicate: F, obs_property: &P) -> Self
+    where
+        P: HasInner<T>,
+    {
+        // Check current value first
+        if let Ok(current) = property
+            .read()
+            .or_else(|poisoned| Ok::<_, ()>(poisoned.into_inner()))
+            .map(|prop| prop.value.clone())
+        {
+            if predicate(&current) {
+                // Condition already met - create a dummy channel
+                let (tx, rx) = std::sync::mpsc::channel();
+                let _ = tx.send(current.clone());
+                return Self {
+                    property,
+                    rx,
+                    subscription_id: None,
+                    result: Some(current),
+                    _phantom: std::marker::PhantomData,
+                };
+            }
+        }
+
+        let predicate = Arc::new(predicate);
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        // Subscribe to changes
+        let subscription_id = obs_property
+            .subscribe_internal(Arc::new(move |_old, new| {
+                if predicate(new) {
+                    let _ = tx.send(new.clone());
+                }
+            }))
+            .ok();
+
+        Self {
+            property,
+            rx,
+            subscription_id,
+            result: None,
+            _phantom: std::marker::PhantomData,
+        }
+    }
+}
+
+#[cfg(feature = "async")]
+impl<T, F> std::future::Future for WaitForFuture<T, F>
+where
+    T: Clone + Send + Sync + Unpin + 'static,
+    F: Fn(&T) -> bool + Send + Sync + Unpin + 'static,
+{
+    type Output = T;
+
+    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        
+        // If we already have a result, return it immediately
+        if let Some(result) = this.result.take() {
+            return Poll::Ready(result);
+        }
+
+        // Try to receive without blocking
+        match this.rx.try_recv() {
+            Ok(value) => {
+                // Clean up subscription
+                if let Some(id) = this.subscription_id.take() {
+                    if let Ok(mut prop) = this.property.write().or_else(|poisoned| Ok::<_, ()>(poisoned.into_inner())) {
+                        prop.observers.remove(&id);
+                    }
+                }
+                Poll::Ready(value)
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => Poll::Pending,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                // Channel disconnected, try to get current value as fallback
+                let value = this
+                    .property
+                    .read()
+                    .or_else(|poisoned| Ok::<_, ()>(poisoned.into_inner()))
+                    .map(|prop| prop.value.clone())
+                    .unwrap();
+                Poll::Ready(value)
+            }
+        }
+    }
+}
+
+#[cfg(feature = "async")]
+impl<T, F> Drop for WaitForFuture<T, F>
+where
+    T: Clone + Send + Sync + Unpin + 'static,
+    F: Fn(&T) -> bool + Send + Sync + Unpin + 'static,
+{
+    fn drop(&mut self) {
+        // Clean up subscription when future is dropped
+        if let Some(id) = self.subscription_id.take() {
+            if let Ok(mut prop) = self.property.write().or_else(|poisoned| Ok::<_, ()>(poisoned.into_inner())) {
+                prop.observers.remove(&id);
+            }
+        }
+    }
+}
+
+// Helper trait to allow WaitForFuture to call subscribe without circular dependencies
+#[cfg(feature = "async")]
+trait HasInner<T: Clone + Send + Sync + 'static> {
+    fn subscribe_internal(&self, observer: Observer<T>) -> Result<ObserverId, PropertyError>;
+}
+
+#[cfg(feature = "async")]
+impl<T: Clone + Send + Sync + 'static> HasInner<T> for ObservableProperty<T> {
+    fn subscribe_internal(&self, observer: Observer<T>) -> Result<ObserverId, PropertyError> {
+        self.subscribe(observer)
     }
 }
 
