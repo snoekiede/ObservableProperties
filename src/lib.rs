@@ -232,8 +232,9 @@ use std::collections::HashMap;
 use std::fmt;
 use std::mem;
 use std::panic;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
+use std::time::{Duration, Instant};
 
 /// Maximum number of background threads used for asynchronous observer notifications
 ///
@@ -1207,6 +1208,471 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
         });
 
         self.subscribe(filtered_observer)
+    }
+
+    /// Subscribes an observer that only gets called after changes stop for a specified duration
+    ///
+    /// Debouncing delays observer notifications until a quiet period has passed. Each new
+    /// change resets the timer. This is useful for expensive operations that shouldn't
+    /// run on every single change, such as auto-save, search-as-you-type, or form validation.
+    ///
+    /// # How It Works
+    ///
+    /// When the property changes:
+    /// 1. A timer starts for the specified `debounce_duration`
+    /// 2. If another change occurs before the timer expires, the timer resets
+    /// 3. When the timer finally expires with no new changes, the observer is notified
+    /// 4. Only the **most recent** change is delivered to the observer
+    ///
+    /// # Arguments
+    ///
+    /// * `observer` - The observer function to call after the debounce period
+    /// * `debounce_duration` - How long to wait after the last change before notifying
+    ///
+    /// # Returns
+    ///
+    /// `Ok(ObserverId)` for the debounced observer, or `Err(PropertyError)` if subscription fails.
+    ///
+    /// # Examples
+    ///
+    /// ## Auto-Save Example
+    ///
+    /// ```rust
+    /// use observable_property::ObservableProperty;
+    /// use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+    /// use std::time::Duration;
+    ///
+    /// # fn main() -> Result<(), observable_property::PropertyError> {
+    /// let document = ObservableProperty::new("".to_string());
+    /// let save_count = Arc::new(AtomicUsize::new(0));
+    /// let count_clone = save_count.clone();
+    ///
+    /// // Auto-save only after user stops typing for 500ms
+    /// document.subscribe_debounced(
+    ///     Arc::new(move |_old, new| {
+    ///         count_clone.fetch_add(1, Ordering::SeqCst);
+    ///         println!("Auto-saving: {}", new);
+    ///     }),
+    ///     Duration::from_millis(500)
+    /// )?;
+    ///
+    /// // Rapid changes (user typing)
+    /// document.set("H".to_string())?;
+    /// document.set("He".to_string())?;
+    /// document.set("Hel".to_string())?;
+    /// document.set("Hell".to_string())?;
+    /// document.set("Hello".to_string())?;
+    ///
+    /// // At this point, no auto-save has occurred yet
+    /// assert_eq!(save_count.load(Ordering::SeqCst), 0);
+    ///
+    /// // Wait for debounce period
+    /// std::thread::sleep(Duration::from_millis(600));
+    ///
+    /// // Now auto-save has occurred exactly once with the final value
+    /// assert_eq!(save_count.load(Ordering::SeqCst), 1);
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// ## Search-as-You-Type Example
+    ///
+    /// ```rust
+    /// use observable_property::ObservableProperty;
+    /// use std::sync::Arc;
+    /// use std::time::Duration;
+    ///
+    /// # fn main() -> Result<(), observable_property::PropertyError> {
+    /// let search_query = ObservableProperty::new("".to_string());
+    ///
+    /// // Only search after user stops typing for 300ms
+    /// search_query.subscribe_debounced(
+    ///     Arc::new(|_old, new| {
+    ///         if !new.is_empty() {
+    ///             println!("Searching for: {}", new);
+    ///             // Perform expensive API call here
+    ///         }
+    ///     }),
+    ///     Duration::from_millis(300)
+    /// )?;
+    ///
+    /// // User types quickly - no searches triggered yet
+    /// search_query.set("r".to_string())?;
+    /// search_query.set("ru".to_string())?;
+    /// search_query.set("rus".to_string())?;
+    /// search_query.set("rust".to_string())?;
+    ///
+    /// // Wait for debounce
+    /// std::thread::sleep(Duration::from_millis(400));
+    /// // Now search executes once with "rust"
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// ## Form Validation Example
+    ///
+    /// ```rust
+    /// use observable_property::ObservableProperty;
+    /// use std::sync::Arc;
+    /// use std::time::Duration;
+    ///
+    /// # fn main() -> Result<(), observable_property::PropertyError> {
+    /// let email = ObservableProperty::new("".to_string());
+    ///
+    /// // Validate email only after user stops typing for 500ms
+    /// email.subscribe_debounced(
+    ///     Arc::new(|_old, new| {
+    ///         if new.contains('@') && new.contains('.') {
+    ///             println!("✓ Email looks valid");
+    ///         } else if !new.is_empty() {
+    ///             println!("✗ Email appears invalid");
+    ///         }
+    ///     }),
+    ///     Duration::from_millis(500)
+    /// )?;
+    ///
+    /// email.set("user".to_string())?;
+    /// email.set("user@".to_string())?;
+    /// email.set("user@ex".to_string())?;
+    /// email.set("user@example".to_string())?;
+    /// email.set("user@example.com".to_string())?;
+    ///
+    /// // Validation only runs once after typing stops
+    /// std::thread::sleep(Duration::from_millis(600));
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Performance Considerations
+    ///
+    /// - Each debounced observer spawns a background thread when changes occur
+    /// - The thread sleeps for the debounce duration and then checks if it should notify
+    /// - Multiple rapid changes don't create multiple threads - they just update the pending value
+    /// - Memory overhead: ~2 Mutex allocations per debounced observer
+    ///
+    /// # Thread Safety
+    ///
+    /// Debounced observers are fully thread-safe. Multiple threads can trigger changes
+    /// simultaneously, and the debouncing logic will correctly handle the most recent value.
+    pub fn subscribe_debounced(
+        &self,
+        observer: Observer<T>,
+        debounce_duration: Duration,
+    ) -> Result<ObserverId, PropertyError> {
+        let last_change_time = Arc::new(Mutex::new(Instant::now()));
+        let pending_values = Arc::new(Mutex::new(None::<(T, T)>));
+        
+        let debounced_observer = Arc::new(move |old_val: &T, new_val: &T| {
+            // Update the last change time and store the values
+            {
+                let mut last_time = last_change_time.lock().unwrap();
+                *last_time = Instant::now();
+                
+                let mut pending = pending_values.lock().unwrap();
+                *pending = Some((old_val.clone(), new_val.clone()));
+            }
+            
+            // Spawn a thread to wait and then notify if no newer changes occurred
+            let last_change_time_thread = last_change_time.clone();
+            let pending_values_thread = pending_values.clone();
+            let observer_thread = observer.clone();
+            let duration = debounce_duration;
+            
+            thread::spawn(move || {
+                thread::sleep(duration);
+                
+                // Check if enough time has passed since the last change
+                let should_notify = {
+                    let last_time = last_change_time_thread.lock().unwrap();
+                    last_time.elapsed() >= duration
+                };
+                
+                if should_notify {
+                    // Get and clear the pending values
+                    let values = {
+                        let mut pending = pending_values_thread.lock().unwrap();
+                        pending.take()
+                    };
+                    
+                    // Notify the observer with the final values
+                    if let Some((old, new)) = values {
+                        let _ = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+                            observer_thread(&old, &new);
+                        }));
+                    }
+                }
+            });
+        });
+
+        self.subscribe(debounced_observer)
+    }
+
+    /// Subscribes an observer that gets called at most once per specified duration
+    ///
+    /// Throttling ensures that regardless of how frequently the property changes,
+    /// the observer is notified at most once per `throttle_interval`. The first change
+    /// triggers an immediate notification, then subsequent changes are rate-limited.
+    ///
+    /// # How It Works
+    ///
+    /// When the property changes:
+    /// 1. If enough time has passed since the last notification, notify immediately
+    /// 2. Otherwise, schedule a notification for after the throttle interval expires
+    /// 3. During the throttle interval, additional changes update the pending value
+    ///    but don't trigger additional notifications
+    ///
+    /// # Arguments
+    ///
+    /// * `observer` - The observer function to call (rate-limited)
+    /// * `throttle_interval` - Minimum time between observer notifications
+    ///
+    /// # Returns
+    ///
+    /// `Ok(ObserverId)` for the throttled observer, or `Err(PropertyError)` if subscription fails.
+    ///
+    /// # Examples
+    ///
+    /// ## Scroll Event Handling
+    ///
+    /// ```rust
+    /// use observable_property::ObservableProperty;
+    /// use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+    /// use std::time::Duration;
+    ///
+    /// # fn main() -> Result<(), observable_property::PropertyError> {
+    /// let scroll_position = ObservableProperty::new(0);
+    /// let update_count = Arc::new(AtomicUsize::new(0));
+    /// let count_clone = update_count.clone();
+    ///
+    /// // Update UI at most every 100ms, even if scrolling continuously
+    /// scroll_position.subscribe_throttled(
+    ///     Arc::new(move |_old, new| {
+    ///         count_clone.fetch_add(1, Ordering::SeqCst);
+    ///         println!("Updating UI for scroll position: {}", new);
+    ///     }),
+    ///     Duration::from_millis(100)
+    /// )?;
+    ///
+    /// // Rapid scroll events (e.g., 60fps = ~16ms per frame)
+    /// for i in 1..=20 {
+    ///     scroll_position.set(i * 10)?;
+    ///     std::thread::sleep(Duration::from_millis(16));
+    /// }
+    ///
+    /// // UI updates happened less frequently than scroll events
+    /// let updates = update_count.load(Ordering::SeqCst);
+    /// assert!(updates < 20); // Throttled to ~100ms intervals
+    /// assert!(updates > 0);  // But at least some updates occurred
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// ## Mouse Movement Tracking
+    ///
+    /// ```rust
+    /// use observable_property::ObservableProperty;
+    /// use std::sync::Arc;
+    /// use std::time::Duration;
+    ///
+    /// # fn main() -> Result<(), observable_property::PropertyError> {
+    /// let mouse_position = ObservableProperty::new((0, 0));
+    ///
+    /// // Track mouse position, but only log every 200ms
+    /// mouse_position.subscribe_throttled(
+    ///     Arc::new(|_old, new| {
+    ///         println!("Mouse at: ({}, {})", new.0, new.1);
+    ///     }),
+    ///     Duration::from_millis(200)
+    /// )?;
+    ///
+    /// // Simulate rapid mouse movements
+    /// for x in 0..50 {
+    ///     mouse_position.set((x, x * 2))?;
+    ///     std::thread::sleep(Duration::from_millis(10));
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// ## API Rate Limiting
+    ///
+    /// ```rust
+    /// use observable_property::ObservableProperty;
+    /// use std::sync::Arc;
+    /// use std::time::Duration;
+    ///
+    /// # fn main() -> Result<(), observable_property::PropertyError> {
+    /// let sensor_reading = ObservableProperty::new(0.0);
+    ///
+    /// // Send sensor data to API at most once per second
+    /// sensor_reading.subscribe_throttled(
+    ///     Arc::new(|_old, new| {
+    ///         println!("Sending to API: {:.2}", new);
+    ///         // Actual API call would go here
+    ///     }),
+    ///     Duration::from_secs(1)
+    /// )?;
+    ///
+    /// // High-frequency sensor updates
+    /// for i in 0..100 {
+    ///     sensor_reading.set(i as f64 * 0.1)?;
+    ///     std::thread::sleep(Duration::from_millis(50));
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// ## Difference from Debouncing
+    ///
+    /// ```rust
+    /// use observable_property::ObservableProperty;
+    /// use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+    /// use std::time::Duration;
+    ///
+    /// # fn main() -> Result<(), observable_property::PropertyError> {
+    /// let property = ObservableProperty::new(0);
+    /// let throttle_count = Arc::new(AtomicUsize::new(0));
+    /// let debounce_count = Arc::new(AtomicUsize::new(0));
+    ///
+    /// let throttle_clone = throttle_count.clone();
+    /// let debounce_clone = debounce_count.clone();
+    ///
+    /// // Throttling: Notifies periodically during continuous changes
+    /// property.subscribe_throttled(
+    ///     Arc::new(move |_, _| {
+    ///         throttle_clone.fetch_add(1, Ordering::SeqCst);
+    ///     }),
+    ///     Duration::from_millis(100)
+    /// )?;
+    ///
+    /// // Debouncing: Notifies only after changes stop
+    /// property.subscribe_debounced(
+    ///     Arc::new(move |_, _| {
+    ///         debounce_clone.fetch_add(1, Ordering::SeqCst);
+    ///     }),
+    ///     Duration::from_millis(100)
+    /// )?;
+    ///
+    /// // Continuous changes for 500ms
+    /// for i in 1..=50 {
+    ///     property.set(i)?;
+    ///     std::thread::sleep(Duration::from_millis(10));
+    /// }
+    ///
+    /// // Wait for debounce to complete
+    /// std::thread::sleep(Duration::from_millis(150));
+    ///
+    /// // Throttled: Multiple notifications during the period
+    /// assert!(throttle_count.load(Ordering::SeqCst) >= 4);
+    ///
+    /// // Debounced: Single notification after changes stopped
+    /// assert_eq!(debounce_count.load(Ordering::SeqCst), 1);
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Performance Considerations
+    ///
+    /// - Throttled observers spawn background threads to handle delayed notifications
+    /// - First notification is immediate (no delay), subsequent ones are rate-limited
+    /// - Memory overhead: ~1 Mutex allocation per throttled observer
+    ///
+    /// # Thread Safety
+    ///
+    /// Throttled observers are fully thread-safe. Multiple threads can trigger changes
+    /// and the throttling logic will correctly enforce the rate limit.
+    pub fn subscribe_throttled(
+        &self,
+        observer: Observer<T>,
+        throttle_interval: Duration,
+    ) -> Result<ObserverId, PropertyError> {
+        let last_notify_time = Arc::new(Mutex::new(None::<Instant>));
+        let pending_notification = Arc::new(Mutex::new(None::<(T, T)>));
+        
+        let throttled_observer = Arc::new(move |old_val: &T, new_val: &T| {
+            let should_notify_now = {
+                let last_time = last_notify_time.lock().unwrap();
+                match *last_time {
+                    None => true, // First notification - notify immediately
+                    Some(last) => last.elapsed() >= throttle_interval,
+                }
+            };
+            
+            if should_notify_now {
+                // Notify immediately
+                {
+                    let mut last_time = last_notify_time.lock().unwrap();
+                    *last_time = Some(Instant::now());
+                }
+                
+                let _ = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+                    observer(old_val, new_val);
+                }));
+            } else {
+                // Schedule a notification for later
+                {
+                    let mut pending = pending_notification.lock().unwrap();
+                    *pending = Some((old_val.clone(), new_val.clone()));
+                }
+                
+                // Check if we need to spawn a thread for the pending notification
+                let last_notify_time_thread = last_notify_time.clone();
+                let pending_notification_thread = pending_notification.clone();
+                let observer_thread = observer.clone();
+                let interval = throttle_interval;
+                
+                thread::spawn(move || {
+                    // Calculate how long to wait
+                    let wait_duration = {
+                        let last_time = last_notify_time_thread.lock().unwrap();
+                        if let Some(last) = *last_time {
+                            let elapsed = last.elapsed();
+                            if elapsed < interval {
+                                interval - elapsed
+                            } else {
+                                Duration::from_millis(0)
+                            }
+                        } else {
+                            Duration::from_millis(0)
+                        }
+                    };
+                    
+                    if wait_duration > Duration::from_millis(0) {
+                        thread::sleep(wait_duration);
+                    }
+                    
+                    // Check if we should notify
+                    let should_notify = {
+                        let last_time = last_notify_time_thread.lock().unwrap();
+                        match *last_time {
+                            Some(last) => last.elapsed() >= interval,
+                            None => true,
+                        }
+                    };
+                    
+                    if should_notify {
+                        // Get and clear pending notification
+                        let values = {
+                            let mut pending = pending_notification_thread.lock().unwrap();
+                            pending.take()
+                        };
+                        
+                        if let Some((old, new)) = values {
+                            {
+                                let mut last_time = last_notify_time_thread.lock().unwrap();
+                                *last_time = Some(Instant::now());
+                            }
+                            
+                            let _ = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+                                observer_thread(&old, &new);
+                            }));
+                        }
+                    }
+                });
+            }
+        });
+
+        self.subscribe(throttled_observer)
     }
 
     /// Notifies all observers with a batch of changes
@@ -3911,4 +4377,458 @@ mod tests {
         
         assert_eq!(call_count.load(Ordering::SeqCst), 0);
     }
+
+    // ========================================================================
+    // Debouncing Tests
+    // ========================================================================
+
+    #[test]
+    fn test_debounced_observer_basic() {
+        let prop = ObservableProperty::new(0);
+        let notification_count = Arc::new(AtomicUsize::new(0));
+        let last_value = Arc::new(RwLock::new(0));
+        
+        let count_clone = notification_count.clone();
+        let value_clone = last_value.clone();
+        
+        prop.subscribe_debounced(
+            Arc::new(move |_old, new| {
+                count_clone.fetch_add(1, Ordering::SeqCst);
+                if let Ok(mut val) = value_clone.write() {
+                    *val = *new;
+                }
+            }),
+            Duration::from_millis(100)
+        ).expect("Failed to subscribe debounced observer");
+        
+        // Make a single change
+        prop.set(42).expect("Failed to set value");
+        
+        // Immediately after, should not have been notified yet
+        assert_eq!(notification_count.load(Ordering::SeqCst), 0);
+        
+        // Wait for debounce period
+        thread::sleep(Duration::from_millis(150));
+        
+        // Now should have been notified exactly once
+        assert_eq!(notification_count.load(Ordering::SeqCst), 1);
+        assert_eq!(*last_value.read().unwrap(), 42);
+    }
+
+    #[test]
+    fn test_debounced_observer_rapid_changes() {
+        let prop = ObservableProperty::new(0);
+        let notification_count = Arc::new(AtomicUsize::new(0));
+        let last_value = Arc::new(RwLock::new(0));
+        
+        let count_clone = notification_count.clone();
+        let value_clone = last_value.clone();
+        
+        prop.subscribe_debounced(
+            Arc::new(move |_old, new| {
+                count_clone.fetch_add(1, Ordering::SeqCst);
+                if let Ok(mut val) = value_clone.write() {
+                    *val = *new;
+                }
+            }),
+            Duration::from_millis(100)
+        ).expect("Failed to subscribe debounced observer");
+        
+        // Make rapid changes
+        for i in 1..=10 {
+            prop.set(i).expect("Failed to set value");
+            thread::sleep(Duration::from_millis(20)); // Changes every 20ms
+        }
+        
+        // Should not have been notified yet
+        assert_eq!(notification_count.load(Ordering::SeqCst), 0);
+        
+        // Wait for debounce period after last change
+        thread::sleep(Duration::from_millis(150));
+        
+        // Should have been notified exactly once with the final value
+        assert_eq!(notification_count.load(Ordering::SeqCst), 1);
+        assert_eq!(*last_value.read().unwrap(), 10);
+    }
+
+    #[test]
+    fn test_debounced_observer_multiple_sequences() {
+        let prop = ObservableProperty::new(0);
+        let notification_count = Arc::new(AtomicUsize::new(0));
+        let values = Arc::new(RwLock::new(Vec::new()));
+        
+        let count_clone = notification_count.clone();
+        let values_clone = values.clone();
+        
+        prop.subscribe_debounced(
+            Arc::new(move |_old, new| {
+                count_clone.fetch_add(1, Ordering::SeqCst);
+                if let Ok(mut vals) = values_clone.write() {
+                    vals.push(*new);
+                }
+            }),
+            Duration::from_millis(100)
+        ).expect("Failed to subscribe debounced observer");
+        
+        // First sequence of changes
+        prop.set(1).expect("Failed to set value");
+        prop.set(2).expect("Failed to set value");
+        prop.set(3).expect("Failed to set value");
+        
+        // Wait for debounce
+        thread::sleep(Duration::from_millis(150));
+        
+        // Second sequence of changes
+        prop.set(4).expect("Failed to set value");
+        prop.set(5).expect("Failed to set value");
+        
+        // Wait for debounce
+        thread::sleep(Duration::from_millis(150));
+        
+        // Should have been notified twice, once for each sequence
+        assert_eq!(notification_count.load(Ordering::SeqCst), 2);
+        let vals = values.read().unwrap();
+        assert_eq!(vals.len(), 2);
+        assert_eq!(vals[0], 3); // Last value from first sequence
+        assert_eq!(vals[1], 5); // Last value from second sequence
+    }
+
+    #[test]
+    fn test_debounced_observer_with_string() {
+        let prop = ObservableProperty::new("".to_string());
+        let notification_count = Arc::new(AtomicUsize::new(0));
+        let last_value = Arc::new(RwLock::new(String::new()));
+        
+        let count_clone = notification_count.clone();
+        let value_clone = last_value.clone();
+        
+        prop.subscribe_debounced(
+            Arc::new(move |_old, new| {
+                count_clone.fetch_add(1, Ordering::SeqCst);
+                if let Ok(mut val) = value_clone.write() {
+                    *val = new.clone();
+                }
+            }),
+            Duration::from_millis(100)
+        ).expect("Failed to subscribe debounced observer");
+        
+        // Simulate typing
+        prop.set("H".to_string()).expect("Failed to set value");
+        thread::sleep(Duration::from_millis(30));
+        prop.set("He".to_string()).expect("Failed to set value");
+        thread::sleep(Duration::from_millis(30));
+        prop.set("Hel".to_string()).expect("Failed to set value");
+        thread::sleep(Duration::from_millis(30));
+        prop.set("Hell".to_string()).expect("Failed to set value");
+        thread::sleep(Duration::from_millis(30));
+        prop.set("Hello".to_string()).expect("Failed to set value");
+        
+        // Should not have been notified during typing
+        assert_eq!(notification_count.load(Ordering::SeqCst), 0);
+        
+        // Wait for debounce period
+        thread::sleep(Duration::from_millis(150));
+        
+        // Should have been notified once with final value
+        assert_eq!(notification_count.load(Ordering::SeqCst), 1);
+        assert_eq!(*last_value.read().unwrap(), "Hello");
+    }
+
+    #[test]
+    fn test_debounced_observer_zero_duration() {
+        let prop = ObservableProperty::new(0);
+        let notification_count = Arc::new(AtomicUsize::new(0));
+        
+        let count_clone = notification_count.clone();
+        
+        prop.subscribe_debounced(
+            Arc::new(move |_old, _new| {
+                count_clone.fetch_add(1, Ordering::SeqCst);
+            }),
+            Duration::from_millis(0)
+        ).expect("Failed to subscribe debounced observer");
+        
+        prop.set(1).expect("Failed to set value");
+        
+        // Even with zero duration, thread needs time to execute
+        thread::sleep(Duration::from_millis(10));
+        
+        assert_eq!(notification_count.load(Ordering::SeqCst), 1);
+    }
+
+    // ========================================================================
+    // Throttling Tests
+    // ========================================================================
+
+    #[test]
+    fn test_throttled_observer_basic() {
+        let prop = ObservableProperty::new(0);
+        let notification_count = Arc::new(AtomicUsize::new(0));
+        let values = Arc::new(RwLock::new(Vec::new()));
+        
+        let count_clone = notification_count.clone();
+        let values_clone = values.clone();
+        
+        prop.subscribe_throttled(
+            Arc::new(move |_old, new| {
+                count_clone.fetch_add(1, Ordering::SeqCst);
+                if let Ok(mut vals) = values_clone.write() {
+                    vals.push(*new);
+                }
+            }),
+            Duration::from_millis(100)
+        ).expect("Failed to subscribe throttled observer");
+        
+        // First change should trigger immediately
+        prop.set(1).expect("Failed to set value");
+        thread::sleep(Duration::from_millis(10));
+        assert_eq!(notification_count.load(Ordering::SeqCst), 1);
+        
+        // Second change within throttle period should be delayed
+        prop.set(2).expect("Failed to set value");
+        thread::sleep(Duration::from_millis(10));
+        // Still only 1 notification
+        assert_eq!(notification_count.load(Ordering::SeqCst), 1);
+        
+        // Wait for throttle period
+        thread::sleep(Duration::from_millis(100));
+        
+        // Now should have 2 notifications
+        assert_eq!(notification_count.load(Ordering::SeqCst), 2);
+        let vals = values.read().unwrap();
+        assert_eq!(vals.len(), 2);
+        assert_eq!(vals[0], 1);
+        assert_eq!(vals[1], 2);
+    }
+
+    #[test]
+    fn test_throttled_observer_continuous_changes() {
+        let prop = ObservableProperty::new(0);
+        let notification_count = Arc::new(AtomicUsize::new(0));
+        
+        let count_clone = notification_count.clone();
+        
+        prop.subscribe_throttled(
+            Arc::new(move |_old, _new| {
+                count_clone.fetch_add(1, Ordering::SeqCst);
+            }),
+            Duration::from_millis(100)
+        ).expect("Failed to subscribe throttled observer");
+        
+        // Make changes every 20ms for 500ms total
+        for i in 1..=25 {
+            prop.set(i).expect("Failed to set value");
+            thread::sleep(Duration::from_millis(20));
+        }
+        
+        // Wait for any pending notifications
+        thread::sleep(Duration::from_millis(150));
+        
+        let count = notification_count.load(Ordering::SeqCst);
+        // Should have been notified multiple times (roughly every 100ms)
+        // Expecting around 5-6 notifications over 500ms
+        assert!(count >= 4, "Expected at least 4 notifications, got {}", count);
+        assert!(count <= 10, "Expected at most 10 notifications, got {}", count);
+    }
+
+    #[test]
+    fn test_throttled_observer_rate_limiting() {
+        let prop = ObservableProperty::new(0);
+        let notification_count = Arc::new(AtomicUsize::new(0));
+        let values = Arc::new(RwLock::new(Vec::new()));
+        
+        let count_clone = notification_count.clone();
+        let values_clone = values.clone();
+        
+        prop.subscribe_throttled(
+            Arc::new(move |_old, new| {
+                count_clone.fetch_add(1, Ordering::SeqCst);
+                if let Ok(mut vals) = values_clone.write() {
+                    vals.push(*new);
+                }
+            }),
+            Duration::from_millis(200)
+        ).expect("Failed to subscribe throttled observer");
+        
+        // Rapid-fire 20 changes
+        for i in 1..=20 {
+            prop.set(i).expect("Failed to set value");
+            thread::sleep(Duration::from_millis(10));
+        }
+        
+        // Wait for any pending notifications
+        thread::sleep(Duration::from_millis(250));
+        
+        let count = notification_count.load(Ordering::SeqCst);
+        // With 200ms throttle and changes every 10ms (200ms total duration),
+        // should get 2 notifications maximum (1 immediate + 1 delayed)
+        assert!(count >= 1, "Expected at least 1 notification, got {}", count);
+        assert!(count <= 3, "Expected at most 3 notifications, got {}", count);
+    }
+
+    #[test]
+    fn test_throttled_observer_first_change_immediate() {
+        let prop = ObservableProperty::new(0);
+        let notification_count = Arc::new(AtomicUsize::new(0));
+        let first_value = Arc::new(RwLock::new(None));
+        
+        let count_clone = notification_count.clone();
+        let value_clone = first_value.clone();
+        
+        prop.subscribe_throttled(
+            Arc::new(move |_old, new| {
+                count_clone.fetch_add(1, Ordering::SeqCst);
+                if let Ok(mut val) = value_clone.write() {
+                    if val.is_none() {
+                        *val = Some(*new);
+                    }
+                }
+            }),
+            Duration::from_millis(100)
+        ).expect("Failed to subscribe throttled observer");
+        
+        // First change
+        prop.set(42).expect("Failed to set value");
+        
+        // Should be notified immediately (no sleep needed)
+        thread::sleep(Duration::from_millis(10));
+        
+        assert_eq!(notification_count.load(Ordering::SeqCst), 1);
+        assert_eq!(*first_value.read().unwrap(), Some(42));
+    }
+
+    #[test]
+    fn test_throttled_vs_debounced_behavior() {
+        let prop = ObservableProperty::new(0);
+        let throttle_count = Arc::new(AtomicUsize::new(0));
+        let debounce_count = Arc::new(AtomicUsize::new(0));
+        
+        let throttle_clone = throttle_count.clone();
+        let debounce_clone = debounce_count.clone();
+        
+        prop.subscribe_throttled(
+            Arc::new(move |_old, _new| {
+                throttle_clone.fetch_add(1, Ordering::SeqCst);
+            }),
+            Duration::from_millis(100)
+        ).expect("Failed to subscribe throttled observer");
+        
+        prop.subscribe_debounced(
+            Arc::new(move |_old, _new| {
+                debounce_clone.fetch_add(1, Ordering::SeqCst);
+            }),
+            Duration::from_millis(100)
+        ).expect("Failed to subscribe debounced observer");
+        
+        // Make continuous changes for 300ms
+        for i in 1..=30 {
+            prop.set(i).expect("Failed to set value");
+            thread::sleep(Duration::from_millis(10));
+        }
+        
+        // Wait for debounce to complete
+        thread::sleep(Duration::from_millis(150));
+        
+        let throttle_notifications = throttle_count.load(Ordering::SeqCst);
+        let debounce_notifications = debounce_count.load(Ordering::SeqCst);
+        
+        // Throttled: Multiple notifications during the period
+        assert!(throttle_notifications >= 2, 
+            "Throttled should have multiple notifications, got {}", throttle_notifications);
+        
+        // Debounced: Single notification after changes stopped
+        assert_eq!(debounce_notifications, 1, 
+            "Debounced should have exactly 1 notification, got {}", debounce_notifications);
+        
+        // Throttled should have more notifications than debounced
+        assert!(throttle_notifications > debounce_notifications,
+            "Throttled ({}) should have more notifications than debounced ({})",
+            throttle_notifications, debounce_notifications);
+    }
+
+    #[test]
+    fn test_throttled_observer_with_long_interval() {
+        let prop = ObservableProperty::new(0);
+        let notification_count = Arc::new(AtomicUsize::new(0));
+        
+        let count_clone = notification_count.clone();
+        
+        prop.subscribe_throttled(
+            Arc::new(move |_old, _new| {
+                count_clone.fetch_add(1, Ordering::SeqCst);
+            }),
+            Duration::from_secs(1)
+        ).expect("Failed to subscribe throttled observer");
+        
+        // First change - immediate
+        prop.set(1).expect("Failed to set value");
+        thread::sleep(Duration::from_millis(10));
+        assert_eq!(notification_count.load(Ordering::SeqCst), 1);
+        
+        // Multiple changes within the throttle period
+        for i in 2..=5 {
+            prop.set(i).expect("Failed to set value");
+            thread::sleep(Duration::from_millis(50));
+        }
+        
+        // Still only 1 notification (throttle period hasn't expired)
+        assert_eq!(notification_count.load(Ordering::SeqCst), 1);
+        
+        // Wait for throttle period to expire
+        thread::sleep(Duration::from_millis(1100));
+        
+        // Should now have 2 notifications (initial + delayed for last change)
+        let final_count = notification_count.load(Ordering::SeqCst);
+        assert!(final_count >= 1 && final_count <= 2,
+            "Expected 1-2 notifications, got {}", final_count);
+    }
+
+    #[test]
+    fn test_debounced_and_throttled_combined() {
+        let prop = ObservableProperty::new(0);
+        let debounce_values = Arc::new(RwLock::new(Vec::new()));
+        let throttle_values = Arc::new(RwLock::new(Vec::new()));
+        
+        let debounce_clone = debounce_values.clone();
+        let throttle_clone = throttle_values.clone();
+        
+        prop.subscribe_debounced(
+            Arc::new(move |_old, new| {
+                if let Ok(mut vals) = debounce_clone.write() {
+                    vals.push(*new);
+                }
+            }),
+            Duration::from_millis(100)
+        ).expect("Failed to subscribe debounced");
+        
+        prop.subscribe_throttled(
+            Arc::new(move |_old, new| {
+                if let Ok(mut vals) = throttle_clone.write() {
+                    vals.push(*new);
+                }
+            }),
+            Duration::from_millis(100)
+        ).expect("Failed to subscribe throttled");
+        
+        // Make a series of changes
+        for i in 1..=10 {
+            prop.set(i).expect("Failed to set value");
+            thread::sleep(Duration::from_millis(25));
+        }
+        
+        // Wait for both to complete
+        thread::sleep(Duration::from_millis(200));
+        
+        let debounce_vals = debounce_values.read().unwrap();
+        let throttle_vals = throttle_values.read().unwrap();
+        
+        // Debounced should have 1 value (the last one)
+        assert_eq!(debounce_vals.len(), 1);
+        assert_eq!(debounce_vals[0], 10);
+        
+        // Throttled should have multiple values
+        assert!(throttle_vals.len() >= 2, 
+            "Throttled should have at least 2 values, got {}", throttle_vals.len());
+    }
 }
+

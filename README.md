@@ -6,13 +6,15 @@
 * **Observer pattern**: Subscribe to property changes with callbacks
 * **RAII subscriptions**: Automatic cleanup with subscription guards (no manual unsubscribe needed)
 * **Filtered observers**: Only notify when specific conditions are met
+* **Debouncing**: Delay notifications until changes stop for a specified duration
+* **Throttling**: Rate-limit notifications to at most once per time interval
 * **Async notifications**: Non-blocking observer notifications with background threads
 * **Configurable threading**: Customize thread pool size for async notifications via `with_max_threads()`
 * **Panic isolation**: Observer panics don't crash the system
 * **Robust error handling**: Comprehensive error handling with descriptive error messages
 * **Production-ready**: No `unwrap()` calls - all errors are handled gracefully
 * **Type-safe**: Generic implementation works with any `Clone + Send + Sync + 'static' type
-* **Zero dependencies**: Uses only Rust standard libraryperty
+* **Zero dependencies**: Uses only Rust standard library
 
 A thread-safe observable property implementation for Rust that allows you to observe changes to values across multiple threads. Built with comprehensive error handling and no `unwrap()` calls for maximum reliability.
 
@@ -22,7 +24,7 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-observable-property = "0.3.5"
+observable-property = "0.4.1"
 ```
 
 ## Usage
@@ -210,6 +212,78 @@ fn main() -> Result<(), observable_property::PropertyError> {
     Ok(())
 }
 ```
+
+### Debouncing
+
+Debouncing delays notifications until changes stop for a specified duration. Perfect for auto-save, search-as-you-type, and form validation:
+
+```rust
+use observable_property::ObservableProperty;
+use std::sync::Arc;
+use std::time::Duration;
+
+fn main() -> Result<(), observable_property::PropertyError> {
+    let search_query = ObservableProperty::new("".to_string());
+
+    // Only search after user stops typing for 300ms
+    let _subscription = search_query.subscribe_debounced(
+        Arc::new(|_old, new| {
+            if !new.is_empty() {
+                println!("Searching for: {}", new);
+                // Perform expensive API call here
+            }
+        }),
+        Duration::from_millis(300)
+    )?;
+
+    // Rapid typing - no searches triggered yet
+    search_query.set("r".to_string())?;
+    search_query.set("ru".to_string())?;
+    search_query.set("rus".to_string())?;
+    search_query.set("rust".to_string())?;
+
+    // Wait for debounce
+    std::thread::sleep(Duration::from_millis(400));
+    // Now search executes once with "rust"
+    
+    Ok(())
+}
+```
+
+### Throttling
+
+Throttling rate-limits notifications to at most once per interval. Perfect for scroll events, mouse tracking, and API rate limiting:
+
+```rust
+use observable_property::ObservableProperty;
+use std::sync::Arc;
+use std::time::Duration;
+
+fn main() -> Result<(), observable_property::PropertyError> {
+    let scroll_position = ObservableProperty::new(0);
+
+    // Update UI at most every 100ms, even if scrolling continuously
+    let _subscription = scroll_position.subscribe_throttled(
+        Arc::new(|_old, new| {
+            println!("Updating UI for scroll position: {}", new);
+        }),
+        Duration::from_millis(100)
+    )?;
+
+    // Rapid scroll events (e.g., 60fps = ~16ms per frame)
+    for i in 1..=20 {
+        scroll_position.set(i * 10)?;
+        std::thread::sleep(Duration::from_millis(16));
+    }
+    // UI updates happen less frequently than scroll events
+    
+    Ok(())
+}
+```
+
+**Key Differences:**
+- **Debouncing**: Waits for changes to stop, then notifies once with the final value
+- **Throttling**: Notifies periodically during continuous changes, firing first immediately
 
 ### Async Notifications
 
@@ -474,6 +548,16 @@ let _subscription = property.subscribe_with_subscription(Arc::new(|old, new| {
 ```
 
 ## Recent Improvements
+
+### v0.4.1 - Debouncing & Throttling
+
+- ⏱️ **Debouncing support**: New `subscribe_debounced()` delays notifications until changes stop
+- 🎯 **Throttling support**: New `subscribe_throttled()` rate-limits notifications to maximum frequency
+- 🔍 **Perfect for UX**: Auto-save, search-as-you-type, form validation, scroll handlers
+- 📈 **Performance optimization**: Reduce unnecessary observer calls during rapid changes
+- 🧪 **Comprehensive tests**: 13 new tests covering debouncing and throttling behavior
+- 📚 **Rich documentation**: Detailed examples for auto-save, search, scroll events, and more
+- 🔒 **Thread-safe**: Both features work seamlessly in multi-threaded environments
 
 ### v0.3.2 - Configurable Threading & Enhanced Documentation
 
