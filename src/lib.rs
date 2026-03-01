@@ -2783,6 +2783,223 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
 
         Ok(())
     }
+
+    /// Updates the property through multiple intermediate states and notifies observers for each change
+    ///
+    /// This method is useful for animations, multi-step transformations, or any scenario where
+    /// you want to record and notify observers about intermediate states during a complex update.
+    /// The provided function receives a mutable reference to the current value and returns a
+    /// vector of intermediate states. Observers are notified for each transition between states.
+    ///
+    /// # Behavior
+    ///
+    /// 1. Captures the initial value
+    /// 2. Calls the provided function with `&mut T` to get intermediate states
+    /// 3. Updates the property's value to the final state (last intermediate state, or unchanged if empty)
+    /// 4. Notifies observers for each state transition:
+    ///    - initial → intermediate\[0\]
+    ///    - intermediate\[0\] → intermediate\[1\]
+    ///    - ... → intermediate\[n\]
+    ///
+    /// # Arguments
+    ///
+    /// * `f` - A closure that receives `&mut T` and returns a vector of intermediate states
+    ///
+    /// # Returns
+    ///
+    /// `Ok(())` if successful, or `Err(PropertyError)` if the lock is poisoned.
+    ///
+    /// # Examples
+    ///
+    /// ## Animation with Intermediate States
+    ///
+    /// ```rust
+    /// use observable_property::ObservableProperty;
+    /// use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+    ///
+    /// # fn main() -> Result<(), observable_property::PropertyError> {
+    /// let position = ObservableProperty::new(0);
+    /// let notification_count = Arc::new(AtomicUsize::new(0));
+    /// let count_clone = notification_count.clone();
+    ///
+    /// position.subscribe(Arc::new(move |old, new| {
+    ///     count_clone.fetch_add(1, Ordering::SeqCst);
+    ///     println!("Position: {} -> {}", old, new);
+    /// }))?;
+    ///
+    /// // Animate from 0 to 100 in steps of 25
+    /// position.update_batch(|_current| {
+    ///     vec![25, 50, 75, 100]
+    /// })?;
+    ///
+    /// // Observers were notified 4 times:
+    /// // 0 -> 25, 25 -> 50, 50 -> 75, 75 -> 100
+    /// assert_eq!(notification_count.load(Ordering::SeqCst), 4);
+    /// assert_eq!(position.get()?, 100);
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// ## Multi-Step Transformation
+    ///
+    /// ```rust
+    /// use observable_property::ObservableProperty;
+    /// use std::sync::Arc;
+    ///
+    /// # fn main() -> Result<(), observable_property::PropertyError> {
+    /// let data = ObservableProperty::new(String::from("hello"));
+    ///
+    /// data.subscribe(Arc::new(|old, new| {
+    ///     println!("Transformation: '{}' -> '{}'", old, new);
+    /// }))?;
+    ///
+    /// // Transform through multiple steps
+    /// data.update_batch(|current| {
+    ///     let step1 = current.to_uppercase(); // "HELLO"
+    ///     let step2 = format!("{}!", step1);   // "HELLO!"
+    ///     let step3 = format!("{} WORLD", step2); // "HELLO! WORLD"
+    ///     vec![step1, step2, step3]
+    /// })?;
+    ///
+    /// assert_eq!(data.get()?, "HELLO! WORLD");
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// ## Counter with Intermediate Values
+    ///
+    /// ```rust
+    /// use observable_property::ObservableProperty;
+    /// use std::sync::Arc;
+    ///
+    /// # fn main() -> Result<(), observable_property::PropertyError> {
+    /// let counter = ObservableProperty::new(0);
+    ///
+    /// counter.subscribe(Arc::new(|old, new| {
+    ///     println!("Count: {} -> {}", old, new);
+    /// }))?;
+    ///
+    /// // Increment with recording intermediate states
+    /// counter.update_batch(|current| {
+    ///     *current += 10; // Modify in place (optional)
+    ///     vec![5, 8, 10] // Intermediate states to report
+    /// })?;
+    ///
+    /// // Final value is the last intermediate state
+    /// assert_eq!(counter.get()?, 10);
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// ## Empty Intermediate States
+    ///
+    /// ```rust
+    /// use observable_property::ObservableProperty;
+    /// use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+    ///
+    /// # fn main() -> Result<(), observable_property::PropertyError> {
+    /// let value = ObservableProperty::new(42);
+    /// let was_notified = Arc::new(AtomicBool::new(false));
+    /// let flag = was_notified.clone();
+    ///
+    /// value.subscribe(Arc::new(move |_, _| {
+    ///     flag.store(true, Ordering::SeqCst);
+    /// }))?;
+    ///
+    /// // No intermediate states - value remains unchanged, no notifications
+    /// value.update_batch(|current| {
+    ///     *current = 100; // This modification is ignored
+    ///     Vec::new() // No intermediate states
+    /// })?;
+    ///
+    /// assert!(!was_notified.load(Ordering::SeqCst));
+    /// assert_eq!(value.get()?, 42); // Value unchanged
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Performance Considerations
+    ///
+    /// - Lock is held during function execution and state collection
+    /// - All intermediate states are stored in memory before notification
+    /// - Observers are notified sequentially for each state transition
+    /// - Consider using `set()` or `modify()` if you don't need intermediate state tracking
+    ///
+    /// # Use Cases
+    ///
+    /// - **Animations**: Smooth transitions through intermediate visual states
+    /// - **Progressive calculations**: Show progress through multi-step computations
+    /// - **State machines**: Record transitions through multiple states
+    /// - **Debugging**: Track how a value transforms through complex operations
+    /// - **History tracking**: Maintain a record of transformation steps
+    pub fn update_batch<F>(&self, f: F) -> Result<(), PropertyError>
+    where
+        F: FnOnce(&mut T) -> Vec<T>,
+    {
+        let (initial_value, intermediate_states, observers_snapshot, dead_observer_ids) = {
+            let mut prop = match self.inner.write() {
+                Ok(guard) => guard,
+                Err(poisoned) => {
+                    // Graceful degradation: recover from poisoned write lock
+                    poisoned.into_inner()
+                }
+            };
+
+            let initial_value = prop.value.clone();
+            let states = f(&mut prop.value);
+            
+            // Update to the final state if intermediate states were provided
+            // Otherwise, restore the original value (ignore any in-place modifications)
+            if let Some(final_state) = states.last() {
+                prop.value = final_state.clone();
+            } else {
+                prop.value = initial_value.clone();
+            }
+            
+            // Collect active observers and track dead weak observers
+            let mut observers = Vec::new();
+            let mut dead_ids = Vec::new();
+            for (id, observer_ref) in &prop.observers {
+                if let Some(observer) = observer_ref.try_call() {
+                    observers.push(observer);
+                } else {
+                    // Weak observer is dead, mark for removal
+                    dead_ids.push(*id);
+                }
+            }
+            
+            (initial_value, states, observers, dead_ids)
+        };
+
+        // Notify observers for each state transition
+        if !intermediate_states.is_empty() {
+            let mut previous_state = initial_value;
+            
+            for current_state in intermediate_states {
+                for observer in &observers_snapshot {
+                    if let Err(e) = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+                        observer(&previous_state, &current_state);
+                    })) {
+                        eprintln!("Observer panic in update_batch: {:?}", e);
+                    }
+                }
+                previous_state = current_state;
+            }
+        }
+
+        // Clean up dead weak observers
+        if !dead_observer_ids.is_empty() {
+            let mut prop = match self.inner.write() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            for id in dead_observer_ids {
+                prop.observers.remove(&id);
+            }
+        }
+
+        Ok(())
+    }
 }
 
 impl<T: Clone + Default + Send + Sync + 'static> ObservableProperty<T> {
@@ -5993,6 +6210,215 @@ mod tests {
         // 100 * (1.05)^5 ≈ 127.628
         let final_amount = amount.get().unwrap();
         assert!((final_amount - 127.628_f64).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_update_batch_basic() {
+        let prop = ObservableProperty::new(0);
+        let notifications = Arc::new(RwLock::new(Vec::new()));
+        let notifications_clone = notifications.clone();
+
+        prop.subscribe(Arc::new(move |old, new| {
+            if let Ok(mut notifs) = notifications_clone.write() {
+                notifs.push((*old, *new));
+            }
+        })).expect("Failed to subscribe");
+
+        prop.update_batch(|_current| {
+            vec![10, 20, 30]
+        }).expect("Failed to update_batch");
+
+        let notifs = notifications.read().unwrap();
+        assert_eq!(notifs.len(), 3);
+        assert_eq!(notifs[0], (0, 10));
+        assert_eq!(notifs[1], (10, 20));
+        assert_eq!(notifs[2], (20, 30));
+        assert_eq!(prop.get().unwrap(), 30);
+    }
+
+    #[test]
+    fn test_update_batch_empty_vec() {
+        let prop = ObservableProperty::new(42);
+        let notification_count = Arc::new(AtomicUsize::new(0));
+        let count_clone = notification_count.clone();
+
+        prop.subscribe(Arc::new(move |_, _| {
+            count_clone.fetch_add(1, Ordering::SeqCst);
+        })).expect("Failed to subscribe");
+
+        prop.update_batch(|current| {
+            *current = 100; // This should be ignored
+            Vec::new()
+        }).expect("Failed to update_batch");
+
+        assert_eq!(notification_count.load(Ordering::SeqCst), 0);
+        assert_eq!(prop.get().unwrap(), 42); // Value unchanged
+    }
+
+    #[test]
+    fn test_update_batch_single_state() {
+        let prop = ObservableProperty::new(5);
+        let notifications = Arc::new(RwLock::new(Vec::new()));
+        let notifications_clone = notifications.clone();
+
+        prop.subscribe(Arc::new(move |old, new| {
+            if let Ok(mut notifs) = notifications_clone.write() {
+                notifs.push((*old, *new));
+            }
+        })).expect("Failed to subscribe");
+
+        prop.update_batch(|_current| {
+            vec![10]
+        }).expect("Failed to update_batch");
+
+        let notifs = notifications.read().unwrap();
+        assert_eq!(notifs.len(), 1);
+        assert_eq!(notifs[0], (5, 10));
+        assert_eq!(prop.get().unwrap(), 10);
+    }
+
+    #[test]
+    fn test_update_batch_string_transformation() {
+        let prop = ObservableProperty::new(String::from("hello"));
+        let notifications = Arc::new(RwLock::new(Vec::new()));
+        let notifications_clone = notifications.clone();
+
+        prop.subscribe(Arc::new(move |old, new| {
+            if let Ok(mut notifs) = notifications_clone.write() {
+                notifs.push((old.clone(), new.clone()));
+            }
+        })).expect("Failed to subscribe");
+
+        prop.update_batch(|current| {
+            let step1 = current.to_uppercase();
+            let step2 = format!("{}!", step1);
+            let step3 = format!("{} WORLD", step2);
+            vec![step1, step2, step3]
+        }).expect("Failed to update_batch");
+
+        let notifs = notifications.read().unwrap();
+        assert_eq!(notifs.len(), 3);
+        assert_eq!(notifs[0].0, "hello");
+        assert_eq!(notifs[0].1, "HELLO");
+        assert_eq!(notifs[1].0, "HELLO");
+        assert_eq!(notifs[1].1, "HELLO!");
+        assert_eq!(notifs[2].0, "HELLO!");
+        assert_eq!(notifs[2].1, "HELLO! WORLD");
+        assert_eq!(prop.get().unwrap(), "HELLO! WORLD");
+    }
+
+    #[test]
+    fn test_update_batch_multiple_observers() {
+        let prop = ObservableProperty::new(0);
+        let count1 = Arc::new(AtomicUsize::new(0));
+        let count2 = Arc::new(AtomicUsize::new(0));
+        
+        let count1_clone = count1.clone();
+        let count2_clone = count2.clone();
+
+        prop.subscribe(Arc::new(move |_, _| {
+            count1_clone.fetch_add(1, Ordering::SeqCst);
+        })).expect("Failed to subscribe observer 1");
+
+        prop.subscribe(Arc::new(move |_, _| {
+            count2_clone.fetch_add(1, Ordering::SeqCst);
+        })).expect("Failed to subscribe observer 2");
+
+        prop.update_batch(|_current| {
+            vec![1, 2, 3, 4, 5]
+        }).expect("Failed to update_batch");
+
+        assert_eq!(count1.load(Ordering::SeqCst), 5);
+        assert_eq!(count2.load(Ordering::SeqCst), 5);
+        assert_eq!(prop.get().unwrap(), 5);
+    }
+
+    #[test]
+    fn test_update_batch_with_panicking_observer() {
+        let prop = ObservableProperty::new(0);
+        let good_observer_count = Arc::new(AtomicUsize::new(0));
+        let count_clone = good_observer_count.clone();
+
+        // Observer that panics
+        prop.subscribe(Arc::new(|old, _new| {
+            if *old == 1 {
+                panic!("Observer panic!");
+            }
+        })).expect("Failed to subscribe panicking observer");
+
+        // Observer that should still work
+        prop.subscribe(Arc::new(move |_, _| {
+            count_clone.fetch_add(1, Ordering::SeqCst);
+        })).expect("Failed to subscribe good observer");
+
+        // Should not panic, good observer should still be notified
+        prop.update_batch(|_current| {
+            vec![1, 2, 3]
+        }).expect("Failed to update_batch");
+
+        // Good observer should have been called for all 3 states
+        assert_eq!(good_observer_count.load(Ordering::SeqCst), 3);
+        assert_eq!(prop.get().unwrap(), 3);
+    }
+
+    #[test]
+    fn test_update_batch_thread_safety() {
+        let prop = Arc::new(ObservableProperty::new(0));
+        let notification_count = Arc::new(AtomicUsize::new(0));
+        let count_clone = notification_count.clone();
+
+        prop.subscribe(Arc::new(move |_, _| {
+            count_clone.fetch_add(1, Ordering::SeqCst);
+        })).expect("Failed to subscribe");
+
+        let handles: Vec<_> = (0..5).map(|i| {
+            let prop_clone = prop.clone();
+            thread::spawn(move || {
+                prop_clone.update_batch(|_current| {
+                    vec![i * 10 + 1, i * 10 + 2, i * 10 + 3]
+                }).expect("Failed to update_batch in thread");
+            })
+        }).collect();
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        // 5 threads * 3 states each = 15 notifications
+        assert_eq!(notification_count.load(Ordering::SeqCst), 15);
+    }
+
+    #[test]
+    fn test_update_batch_with_weak_observers() {
+        let prop = ObservableProperty::new(0);
+        let notification_count = Arc::new(AtomicUsize::new(0));
+        let count_clone = notification_count.clone();
+
+        let observer: Arc<dyn Fn(&i32, &i32) + Send + Sync> = Arc::new(move |_, _| {
+            count_clone.fetch_add(1, Ordering::SeqCst);
+        });
+
+        prop.subscribe_weak(Arc::downgrade(&observer))
+            .expect("Failed to subscribe weak observer");
+
+        // Observer is alive, should get notifications
+        prop.update_batch(|_current| {
+            vec![1, 2, 3]
+        }).expect("Failed to update_batch");
+
+        assert_eq!(notification_count.load(Ordering::SeqCst), 3);
+
+        // Drop the observer
+        drop(observer);
+
+        // Observer is dead, should not get notifications
+        prop.update_batch(|_current| {
+            vec![4, 5, 6]
+        }).expect("Failed to update_batch");
+
+        // Count should still be 3 (no new notifications)
+        assert_eq!(notification_count.load(Ordering::SeqCst), 3);
+        assert_eq!(prop.get().unwrap(), 6);
     }
 }
 
