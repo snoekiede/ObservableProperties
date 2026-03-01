@@ -4221,6 +4221,236 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
         Ok(())
     }
 
+    /// Creates a derived property that automatically updates when this property changes
+    ///
+    /// This method applies a transformation function to create a new `ObservableProperty` of a
+    /// potentially different type. The derived property automatically updates whenever the source
+    /// property changes, maintaining the transformation relationship.
+    ///
+    /// This enables functional reactive programming patterns and property chaining, similar to
+    /// `map` operations in functional programming or reactive frameworks.
+    ///
+    /// # Type Parameters
+    ///
+    /// * `U` - The type of the derived property (must be `Clone + Send + Sync + 'static`)
+    /// * `F` - The transformation function type
+    ///
+    /// # Arguments
+    ///
+    /// * `transform` - A function that converts values from type `T` to type `U`
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(ObservableProperty<U>)` - The derived property with the transformed initial value
+    /// * `Err(PropertyError)` - If unable to read the source property or create the subscription
+    ///
+    /// # Lifetime and Ownership
+    ///
+    /// - The derived property remains connected to the source property through an observer subscription
+    /// - The subscription keeps both properties alive as long as the source has observers
+    /// - When the derived property is dropped, updates stop, but the source property continues working
+    /// - The transformation function is called immediately to compute the initial value, then on every change
+    ///
+    /// # Examples
+    ///
+    /// ## Temperature Conversion (Celsius to Fahrenheit)
+    ///
+    /// ```rust
+    /// use observable_property::ObservableProperty;
+    /// use std::sync::Arc;
+    ///
+    /// # fn main() -> Result<(), observable_property::PropertyError> {
+    /// // Create a Celsius property
+    /// let celsius = ObservableProperty::new(20.0);
+    ///
+    /// // Derive a Fahrenheit property that auto-updates
+    /// let fahrenheit = celsius.map(|c| c * 9.0 / 5.0 + 32.0)?;
+    ///
+    /// assert_eq!(fahrenheit.get()?, 68.0);
+    ///
+    /// // Observe the derived property
+    /// let _sub = fahrenheit.subscribe_with_subscription(Arc::new(|_old, new| {
+    ///     println!("Fahrenheit: {:.1}°F", new);
+    /// }))?;
+    ///
+    /// celsius.set(25.0)?;  // Prints: "Fahrenheit: 77.0°F"
+    /// assert_eq!(fahrenheit.get()?, 77.0);
+    ///
+    /// celsius.set(0.0)?;   // Prints: "Fahrenheit: 32.0°F"
+    /// assert_eq!(fahrenheit.get()?, 32.0);
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// ## String Formatting
+    ///
+    /// ```rust
+    /// use observable_property::ObservableProperty;
+    ///
+    /// # fn main() -> Result<(), observable_property::PropertyError> {
+    /// let count = ObservableProperty::new(42);
+    ///
+    /// // Create a formatted string property
+    /// let message = count.map(|n| format!("Count: {}", n))?;
+    ///
+    /// assert_eq!(message.get()?, "Count: 42");
+    ///
+    /// count.set(100)?;
+    /// assert_eq!(message.get()?, "Count: 100");
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// ## Mathematical Transformations
+    ///
+    /// ```rust
+    /// use observable_property::ObservableProperty;
+    ///
+    /// # fn main() -> Result<(), observable_property::PropertyError> {
+    /// let radius = ObservableProperty::new(5.0);
+    ///
+    /// // Derive area from radius (πr²)
+    /// let area = radius.map(|r| std::f64::consts::PI * r * r)?;
+    ///
+    /// assert!((area.get()? - 78.54).abs() < 0.01);
+    ///
+    /// radius.set(10.0)?;
+    /// assert!((area.get()? - 314.16).abs() < 0.01);
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// ## Chaining Multiple Transformations
+    ///
+    /// ```rust
+    /// use observable_property::ObservableProperty;
+    ///
+    /// # fn main() -> Result<(), observable_property::PropertyError> {
+    /// let base = ObservableProperty::new(10);
+    ///
+    /// // Chain multiple transformations
+    /// let doubled = base.map(|x| x * 2)?;
+    /// let squared = doubled.map(|x| x * x)?;
+    /// let formatted = squared.map(|x| format!("Result: {}", x))?;
+    ///
+    /// assert_eq!(formatted.get()?, "Result: 400");
+    ///
+    /// base.set(5)?;
+    /// assert_eq!(formatted.get()?, "Result: 100");  // (5 * 2)² = 100
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// ## Type Conversion
+    ///
+    /// ```rust
+    /// use observable_property::ObservableProperty;
+    ///
+    /// # fn main() -> Result<(), observable_property::PropertyError> {
+    /// let integer = ObservableProperty::new(42);
+    ///
+    /// // Convert integer to float
+    /// let float_value = integer.map(|i| *i as f64)?;
+    /// assert_eq!(float_value.get()?, 42.0);
+    ///
+    /// // Convert to boolean (is even?)
+    /// let is_even = integer.map(|i| i % 2 == 0)?;
+    /// assert_eq!(is_even.get()?, true);
+    ///
+    /// integer.set(43)?;
+    /// assert_eq!(is_even.get()?, false);
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// ## Complex Object Transformation
+    ///
+    /// ```rust
+    /// use observable_property::ObservableProperty;
+    ///
+    /// # fn main() -> Result<(), observable_property::PropertyError> {
+    /// #[derive(Clone)]
+    /// struct User {
+    ///     first_name: String,
+    ///     last_name: String,
+    ///     age: u32,
+    /// }
+    ///
+    /// let user = ObservableProperty::new(User {
+    ///     first_name: "John".to_string(),
+    ///     last_name: "Doe".to_string(),
+    ///     age: 30,
+    /// });
+    ///
+    /// // Derive full name from user
+    /// let full_name = user.map(|u| format!("{} {}", u.first_name, u.last_name))?;
+    /// assert_eq!(full_name.get()?, "John Doe");
+    ///
+    /// // Derive adult status
+    /// let is_adult = user.map(|u| u.age >= 18)?;
+    /// assert_eq!(is_adult.get()?, true);
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// ## Working with Options
+    ///
+    /// ```rust
+    /// use observable_property::ObservableProperty;
+    ///
+    /// # fn main() -> Result<(), observable_property::PropertyError> {
+    /// let optional = ObservableProperty::new(Some(42));
+    ///
+    /// // Extract value with default
+    /// let value_or_zero = optional.map(|opt| opt.unwrap_or(0))?;
+    /// assert_eq!(value_or_zero.get()?, 42);
+    ///
+    /// optional.set(None)?;
+    /// assert_eq!(value_or_zero.get()?, 0);
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Performance Considerations
+    ///
+    /// - The transformation function is called on every change to the source property
+    /// - Keep transformation functions lightweight for best performance
+    /// - The derived property maintains its own observer list independent of the source
+    /// - Cloning the source property is cheap (internal Arc), but each clone shares the same observers
+    ///
+    /// # Thread Safety
+    ///
+    /// The transformation function must be `Send + Sync + 'static` as it may be called from
+    /// any thread that modifies the source property. Ensure your transformation logic is thread-safe.
+    ///
+    /// # Comparison with `computed()`
+    ///
+    /// - `map()` is simpler and works on a single source property
+    /// - `computed()` can depend on multiple source properties
+    /// - `map()` is an instance method; `computed()` is a standalone function
+    /// - For single-source transformations, `map()` is more ergonomic
+    pub fn map<U, F>(&self, transform: F) -> Result<ObservableProperty<U>, PropertyError>
+    where
+        U: Clone + Send + Sync + 'static,
+        F: Fn(&T) -> U + Send + Sync + 'static,
+    {
+        // Get initial value and transform it
+        let initial_value = self.get()?;
+        let derived = ObservableProperty::new(transform(&initial_value));
+        
+        // Subscribe to source changes and update derived property
+        let derived_clone = derived.clone();
+        let transform = Arc::new(transform);
+        self.subscribe(Arc::new(move |_old, new| {
+            let transformed = transform(new);
+            if let Err(e) = derived_clone.set(transformed) {
+                eprintln!("Failed to update derived property: {}", e);
+            }
+        }))?;
+        
+        Ok(derived)
+    }
+
     /// Updates the property through multiple intermediate states and notifies observers for each change
     ///
     /// This method is useful for animations, multi-step transformations, or any scenario where
