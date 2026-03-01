@@ -473,6 +473,31 @@ impl std::error::Error for PropertyError {}
 /// Function type for observers that get called when property values change
 pub type Observer<T> = Arc<dyn Fn(&T, &T) + Send + Sync>;
 
+/// Represents either a strong or weak reference to an observer
+///
+/// This enum allows the property to manage both strongly-held observers (which keep
+/// the observer alive) and weakly-held observers (which allow automatic cleanup when
+/// the observer is dropped elsewhere).
+enum ObserverRef<T: Clone + Send + Sync + 'static> {
+    /// Strong reference to an observer (keeps the observer alive)
+    Strong(Observer<T>),
+    /// Weak reference to an observer (automatically cleaned up when dropped)
+    Weak(std::sync::Weak<dyn Fn(&T, &T) + Send + Sync>),
+}
+
+impl<T: Clone + Send + Sync + 'static> ObserverRef<T> {
+    /// Attempts to get a callable observer from this reference
+    ///
+    /// For strong references, always returns Some. For weak references, attempts
+    /// to upgrade and returns None if the observer has been dropped.
+    fn try_call(&self) -> Option<Observer<T>> {
+        match self {
+            ObserverRef::Strong(arc) => Some(arc.clone()),
+            ObserverRef::Weak(weak) => weak.upgrade(),
+        }
+    }
+}
+
 /// Unique identifier for registered observers
 pub type ObserverId = usize;
 
@@ -673,15 +698,21 @@ impl<T: Clone + Send + Sync + 'static> Drop for Subscription<T> {
 /// })?;
 /// # Ok::<(), observable_property::PropertyError>(())
 /// ```
-pub struct ObservableProperty<T> {
+pub struct ObservableProperty<T>
+where
+    T: Clone + Send + Sync + 'static,
+{
     inner: Arc<RwLock<InnerProperty<T>>>,
     max_threads: usize,
     max_observers: usize,
 }
 
-struct InnerProperty<T> {
+struct InnerProperty<T>
+where
+    T: Clone + Send + Sync + 'static,
+{
     value: T,
-    observers: HashMap<ObserverId, Observer<T>>,
+    observers: HashMap<ObserverId, ObserverRef<T>>,
     next_id: ObserverId,
 }
 
@@ -1045,7 +1076,7 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
     /// # Ok::<(), observable_property::PropertyError>(())
     /// ```
     pub fn set(&self, new_value: T) -> Result<(), PropertyError> {
-        let (old_value, observers_snapshot) = {
+        let (old_value, observers_snapshot, dead_observer_ids) = {
             let mut prop = match self.inner.write() {
                 Ok(guard) => guard,
                 Err(poisoned) => {
@@ -1057,15 +1088,39 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
 
             // Performance optimization: use mem::replace to avoid one clone operation
             let old_value = mem::replace(&mut prop.value, new_value.clone());
-            let observers_snapshot: Vec<Observer<T>> = prop.observers.values().cloned().collect();
-            (old_value, observers_snapshot)
+            
+            // Collect active observers and track dead weak observers
+            let mut observers_snapshot = Vec::new();
+            let mut dead_ids = Vec::new();
+            for (id, observer_ref) in &prop.observers {
+                if let Some(observer) = observer_ref.try_call() {
+                    observers_snapshot.push(observer);
+                } else {
+                    // Weak observer is dead, mark for removal
+                    dead_ids.push(*id);
+                }
+            }
+            
+            (old_value, observers_snapshot, dead_ids)
         };
 
+        // Notify all active observers
         for observer in observers_snapshot {
             if let Err(e) = panic::catch_unwind(panic::AssertUnwindSafe(|| {
                 observer(&old_value, &new_value);
             })) {
                 eprintln!("Observer panic: {:?}", e);
+            }
+        }
+
+        // Clean up dead weak observers
+        if !dead_observer_ids.is_empty() {
+            let mut prop = match self.inner.write() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            for id in dead_observer_ids {
+                prop.observers.remove(&id);
             }
         }
 
@@ -1202,7 +1257,7 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
     /// # }
     /// ```
     pub fn set_async(&self, new_value: T) -> Result<(), PropertyError> {
-        let (old_value, observers_snapshot) = {
+        let (old_value, observers_snapshot, dead_observer_ids) = {
             let mut prop = match self.inner.write() {
                 Ok(guard) => guard,
                 Err(poisoned) => {
@@ -1213,11 +1268,33 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
 
             // Performance optimization: use mem::replace to avoid one clone operation
             let old_value = mem::replace(&mut prop.value, new_value.clone());
-            let observers_snapshot: Vec<Observer<T>> = prop.observers.values().cloned().collect();
-            (old_value, observers_snapshot)
+            
+            // Collect active observers and track dead weak observers
+            let mut observers_snapshot = Vec::new();
+            let mut dead_ids = Vec::new();
+            for (id, observer_ref) in &prop.observers {
+                if let Some(observer) = observer_ref.try_call() {
+                    observers_snapshot.push(observer);
+                } else {
+                    // Weak observer is dead, mark for removal
+                    dead_ids.push(*id);
+                }
+            }
+            
+            (old_value, observers_snapshot, dead_ids)
         };
 
         if observers_snapshot.is_empty() {
+            // Clean up dead weak observers before returning
+            if !dead_observer_ids.is_empty() {
+                let mut prop = match self.inner.write() {
+                    Ok(guard) => guard,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                for id in dead_observer_ids {
+                    prop.observers.remove(&id);
+                }
+            }
             return Ok(());
         }
 
@@ -1244,6 +1321,17 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
                 }
             });
             // Thread handle intentionally dropped - fire-and-forget pattern
+        }
+
+        // Clean up dead weak observers
+        if !dead_observer_ids.is_empty() {
+            let mut prop = match self.inner.write() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            for id in dead_observer_ids {
+                prop.observers.remove(&id);
+            }
         }
 
         Ok(())
@@ -1322,7 +1410,7 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
         // After ~usize::MAX subscriptions, IDs will wrap around
         // This is acceptable as old observers are typically unsubscribed
         prop.next_id = prop.next_id.wrapping_add(1);
-        prop.observers.insert(id, observer);
+        prop.observers.insert(id, ObserverRef::Strong(observer));
         Ok(id)
     }
 
@@ -1374,6 +1462,163 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
 
         let was_present = prop.observers.remove(&id).is_some();
         Ok(was_present)
+    }
+
+    /// Subscribes a weak observer that automatically cleans up when dropped
+    ///
+    /// Unlike `subscribe()` which holds a strong reference to the observer, this method
+    /// stores only a weak reference. When the observer's `Arc` is dropped elsewhere,
+    /// the observer will be automatically removed from the property on the next notification.
+    ///
+    /// This is useful for scenarios where you want observers to have independent lifetimes
+    /// without needing explicit unsubscribe calls or `Subscription` guards.
+    ///
+    /// # Arguments
+    ///
+    /// * `observer` - A weak reference to the observer function
+    ///
+    /// # Returns
+    ///
+    /// `Ok(ObserverId)` containing a unique identifier for this observer,
+    /// or `Err(PropertyError::InvalidConfiguration)` if the maximum observer limit is exceeded.
+    ///
+    /// # Automatic Cleanup
+    ///
+    /// The observer will be automatically removed when:
+    /// - The `Arc` that the `Weak` was created from is dropped
+    /// - The next notification occurs (via `set()`, `set_async()`, `modify()`, etc.)
+    ///
+    /// # Examples
+    ///
+    /// ## Basic Weak Observer
+    ///
+    /// ```rust
+    /// use observable_property::ObservableProperty;
+    /// use std::sync::Arc;
+    ///
+    /// # fn main() -> Result<(), observable_property::PropertyError> {
+    /// let property = ObservableProperty::new(0);
+    ///
+    /// {
+    ///     // Create observer as trait object
+    ///     let observer: Arc<dyn Fn(&i32, &i32) + Send + Sync> = Arc::new(|old: &i32, new: &i32| {
+    ///         println!("Value changed: {} -> {}", old, new);
+    ///     });
+    ///     
+    ///     // Subscribe with a weak reference
+    ///     property.subscribe_weak(Arc::downgrade(&observer))?;
+    ///     
+    ///     property.set(42)?; // Prints: "Value changed: 0 -> 42"
+    ///     
+    ///     // When observer Arc goes out of scope, weak reference becomes invalid
+    /// }
+    ///
+    /// // Next set automatically cleans up the dead observer
+    /// property.set(100)?; // No output - observer was automatically cleaned up
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// ## Managing Observer Lifetime
+    ///
+    /// ```rust
+    /// use observable_property::ObservableProperty;
+    /// use std::sync::Arc;
+    ///
+    /// # fn main() -> Result<(), observable_property::PropertyError> {
+    /// let property = ObservableProperty::new(String::from("initial"));
+    ///
+    /// // Store the observer Arc somewhere accessible (as trait object)
+    /// let observer: Arc<dyn Fn(&String, &String) + Send + Sync> = Arc::new(|old: &String, new: &String| {
+    ///     println!("Text changed: '{}' -> '{}'", old, new);
+    /// });
+    ///
+    /// property.subscribe_weak(Arc::downgrade(&observer))?;
+    /// property.set(String::from("updated"))?; // Works - observer is alive
+    ///
+    /// // Explicitly drop the observer when done
+    /// drop(observer);
+    ///
+    /// property.set(String::from("final"))?; // No output - observer was dropped
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// ## Multi-threaded Weak Observers
+    ///
+    /// ```rust
+    /// use observable_property::ObservableProperty;
+    /// use std::sync::Arc;
+    /// use std::thread;
+    ///
+    /// # fn main() -> Result<(), observable_property::PropertyError> {
+    /// let property = Arc::new(ObservableProperty::new(0));
+    /// let property_clone = property.clone();
+    ///
+    /// // Create observer as trait object
+    /// let observer: Arc<dyn Fn(&i32, &i32) + Send + Sync> = Arc::new(|old: &i32, new: &i32| {
+    ///     println!("Thread observer: {} -> {}", old, new);
+    /// });
+    ///
+    /// property.subscribe_weak(Arc::downgrade(&observer))?;
+    ///
+    /// let handle = thread::spawn(move || {
+    ///     property_clone.set(42)
+    /// });
+    ///
+    /// handle.join().unwrap()?; // Prints: "Thread observer: 0 -> 42"
+    ///
+    /// // Observer is still alive
+    /// property.set(100)?; // Prints: "Thread observer: 42 -> 100"
+    ///
+    /// // Drop the observer
+    /// drop(observer);
+    /// property.set(200)?; // No output
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Comparison with `subscribe()` and `subscribe_with_subscription()`
+    ///
+    /// - **`subscribe()`**: Holds strong reference, requires manual `unsubscribe()`
+    /// - **`subscribe_with_subscription()`**: Holds strong reference, automatic cleanup via RAII guard
+    /// - **`subscribe_weak()`**: Holds weak reference, cleanup when Arc is dropped elsewhere
+    ///
+    /// Use `subscribe_weak()` when:
+    /// - You want to control observer lifetime independently from subscriptions
+    /// - You need multiple code paths to potentially drop the observer
+    /// - You want to avoid keeping observers alive longer than necessary
+    pub fn subscribe_weak(
+        &self,
+        observer: std::sync::Weak<dyn Fn(&T, &T) + Send + Sync>,
+    ) -> Result<ObserverId, PropertyError> {
+        let mut prop = match self.inner.write() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                // Graceful degradation: recover from poisoned write lock
+                poisoned.into_inner()
+            }
+        };
+
+        // Check observer limit to prevent memory exhaustion
+        if prop.observers.len() >= self.max_observers {
+            return Err(PropertyError::InvalidConfiguration {
+                reason: format!(
+                    "Maximum observer limit ({}) exceeded. Current observers: {}. \
+                     Consider unsubscribing unused observers to free resources.",
+                    self.max_observers,
+                    prop.observers.len()
+                ),
+            });
+        }
+
+        let id = prop.next_id;
+        // Use wrapping_add to prevent overflow panics in production
+        // After ~usize::MAX subscriptions, IDs will wrap around
+        // This is acceptable as old observers are typically unsubscribed
+        prop.next_id = prop.next_id.wrapping_add(1);
+        prop.observers.insert(id, ObserverRef::Weak(observer));
+        Ok(id)
     }
 
     /// Subscribes an observer that only gets called when a filter condition is met
@@ -1961,7 +2206,7 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
     pub fn notify_observers_batch(&self, changes: Vec<(T, T)>) -> Result<(), PropertyError> {
         // Acquire lock, clone observers, then release lock immediately
         // This prevents blocking other operations during potentially long notification process
-        let observers_snapshot = {
+        let (observers_snapshot, dead_observer_ids) = {
             let prop = match self.inner.read() {
                 Ok(guard) => guard,
                 Err(poisoned) => {
@@ -1969,7 +2214,20 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
                     poisoned.into_inner()
                 }
             };
-            prop.observers.values().cloned().collect::<Vec<_>>()
+            
+            // Collect active observers and track dead weak observers
+            let mut observers = Vec::new();
+            let mut dead_ids = Vec::new();
+            for (id, observer_ref) in &prop.observers {
+                if let Some(observer) = observer_ref.try_call() {
+                    observers.push(observer);
+                } else {
+                    // Weak observer is dead, mark for removal
+                    dead_ids.push(*id);
+                }
+            }
+            
+            (observers, dead_ids)
         }; // Lock released here
 
         // Notify observers without holding the lock
@@ -1983,6 +2241,18 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
                 }
             }
         }
+        
+        // Clean up dead weak observers
+        if !dead_observer_ids.is_empty() {
+            let mut prop = match self.inner.write() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            for id in dead_observer_ids {
+                prop.observers.remove(&id);
+            }
+        }
+        
         Ok(())
     }
 
@@ -2463,7 +2733,7 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
     where
         F: FnOnce(&mut T),
     {
-        let (old_value, new_value, observers_snapshot) = {
+        let (old_value, new_value, observers_snapshot, dead_observer_ids) = {
             let mut prop = match self.inner.write() {
                 Ok(guard) => guard,
                 Err(poisoned) => {
@@ -2475,8 +2745,20 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
             let old_value = prop.value.clone();
             f(&mut prop.value);
             let new_value = prop.value.clone();
-            let observers_snapshot: Vec<Observer<T>> = prop.observers.values().cloned().collect();
-            (old_value, new_value, observers_snapshot)
+            
+            // Collect active observers and track dead weak observers
+            let mut observers = Vec::new();
+            let mut dead_ids = Vec::new();
+            for (id, observer_ref) in &prop.observers {
+                if let Some(observer) = observer_ref.try_call() {
+                    observers.push(observer);
+                } else {
+                    // Weak observer is dead, mark for removal
+                    dead_ids.push(*id);
+                }
+            }
+            
+            (old_value, new_value, observers, dead_ids)
         };
 
         // Notify observers with old and new values
@@ -2485,6 +2767,17 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
                 observer(&old_value, &new_value);
             })) {
                 eprintln!("Observer panic in modify: {:?}", e);
+            }
+        }
+
+        // Clean up dead weak observers
+        if !dead_observer_ids.is_empty() {
+            let mut prop = match self.inner.write() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            for id in dead_observer_ids {
+                prop.observers.remove(&id);
             }
         }
 
@@ -2515,7 +2808,7 @@ impl<T: Clone + Default + Send + Sync + 'static> ObservableProperty<T> {
     }
 }
 
-impl<T: Clone> Clone for ObservableProperty<T> {
+impl<T: Clone + Send + Sync + 'static> Clone for ObservableProperty<T> {
     /// Creates a new reference to the same observable property
     ///
     /// This creates a new `ObservableProperty` instance that shares the same
