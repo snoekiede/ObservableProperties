@@ -818,6 +818,9 @@ where
     eq_fn: Option<Arc<dyn Fn(&T, &T) -> bool + Send + Sync>>,
     // Validator function
     validator: Option<Arc<dyn Fn(&T) -> Result<(), String> + Send + Sync>>,
+    // Event sourcing
+    event_log: Option<Vec<PropertyEvent<T>>>,
+    event_log_size: usize,
 }
 
 /// Information about a property change with stack trace
@@ -829,6 +832,24 @@ struct ChangeLog {
     new_value_repr: String,
     backtrace: String,
     thread_id: String,
+}
+
+/// Represents a single change event in the property's history
+///
+/// This struct captures all details of a value change for event sourcing,
+/// enabling time-travel debugging, audit logs, and event replay capabilities.
+#[derive(Clone, Debug)]
+pub struct PropertyEvent<T: Clone> {
+    /// When the change occurred
+    pub timestamp: Instant,
+    /// The value before the change
+    pub old_value: T,
+    /// The value after the change
+    pub new_value: T,
+    /// Sequential event number (starts at 0 for first change)
+    pub event_number: usize,
+    /// Thread that triggered the change (for debugging)
+    pub thread_id: String,
 }
 
 impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
@@ -868,6 +889,8 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
                 batch_initial_value: None,
                 eq_fn: None,
                 validator: None,
+                event_log: None,
+                event_log_size: 0,
             })),
             max_threads: MAX_THREADS,
             max_observers: MAX_OBSERVERS,
@@ -1004,6 +1027,8 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
                 batch_initial_value: None,
                 eq_fn: Some(Arc::new(eq_fn)),
                 validator: None,
+                event_log: None,
+                event_log_size: 0,
             })),
             max_threads: MAX_THREADS,
             max_observers: MAX_OBSERVERS,
@@ -1230,6 +1255,8 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
                 batch_initial_value: None,
                 eq_fn: None,
                 validator: Some(Arc::new(validator)),
+                event_log: None,
+                event_log_size: 0,
             })),
             max_threads: MAX_THREADS,
             max_observers: MAX_OBSERVERS,
@@ -1335,6 +1362,8 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
                 batch_initial_value: None,
                 eq_fn: None,
                 validator: None,
+                event_log: None,
+                event_log_size: 0,
             })),
             max_threads,
             max_observers: MAX_OBSERVERS,
@@ -1655,6 +1684,244 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
                 batch_initial_value: None,
                 eq_fn: None,
                 validator: None,
+                event_log: None,
+                event_log_size: 0,
+            })),
+            max_threads: MAX_THREADS,
+            max_observers: MAX_OBSERVERS,
+        }
+    }
+
+    /// Creates a new observable property with event sourcing enabled
+    ///
+    /// This method enables full event logging for the property, recording every change
+    /// as a timestamped event. This provides powerful capabilities for debugging,
+    /// auditing, and event replay.
+    ///
+    /// # Features
+    ///
+    /// - **Complete Audit Trail**: Every change is recorded with old value, new value, and timestamp
+    /// - **Time-Travel Debugging**: Examine the complete history of state changes
+    /// - **Event Replay**: Reconstruct property state at any point in time
+    /// - **Thread Information**: Each event captures which thread made the change
+    /// - **Sequential Numbering**: Events are numbered starting from 0
+    ///
+    /// # Arguments
+    ///
+    /// * `initial_value` - The starting value for this property
+    /// * `event_log_size` - Maximum number of events to keep in memory (0 = unlimited)
+    ///
+    /// # Memory Considerations
+    ///
+    /// Event logs store complete copies of both old and new values for each change.
+    /// For properties with large values or high update frequency:
+    /// - Use a bounded `event_log_size` to prevent unbounded memory growth
+    /// - Consider using `with_history()` if you only need value snapshots without metadata
+    /// - Monitor memory usage in production environments
+    ///
+    /// When the log exceeds `event_log_size`, the oldest events are automatically removed.
+    ///
+    /// # Examples
+    ///
+    /// ## Basic Event Logging
+    ///
+    /// ```rust
+    /// use observable_property::ObservableProperty;
+    /// use std::sync::Arc;
+    ///
+    /// # fn main() -> Result<(), observable_property::PropertyError> {
+    /// // Create property with unlimited event log
+    /// let counter = ObservableProperty::with_event_log(0, 0);
+    ///
+    /// counter.set(1)?;
+    /// counter.set(2)?;
+    /// counter.set(3)?;
+    ///
+    /// // Retrieve the complete event log
+    /// let events = counter.get_event_log();
+    /// assert_eq!(events.len(), 3);
+    ///
+    /// // Examine first event
+    /// assert_eq!(events[0].old_value, 0);
+    /// assert_eq!(events[0].new_value, 1);
+    /// assert_eq!(events[0].event_number, 0);
+    ///
+    /// // Examine last event
+    /// assert_eq!(events[2].old_value, 2);
+    /// assert_eq!(events[2].new_value, 3);
+    /// assert_eq!(events[2].event_number, 2);
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// ## Bounded Event Log
+    ///
+    /// ```rust
+    /// use observable_property::ObservableProperty;
+    ///
+    /// # fn main() -> Result<(), observable_property::PropertyError> {
+    /// // Keep only the last 3 events
+    /// let property = ObservableProperty::with_event_log(100, 3);
+    ///
+    /// property.set(101)?;
+    /// property.set(102)?;
+    /// property.set(103)?;
+    /// property.set(104)?; // Oldest event (100->101) is now removed
+    ///
+    /// let events = property.get_event_log();
+    /// assert_eq!(events.len(), 3);
+    /// assert_eq!(events[0].old_value, 101);
+    /// assert_eq!(events[2].new_value, 104);
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// ## Time-Travel Debugging
+    ///
+    /// ```rust
+    /// use observable_property::ObservableProperty;
+    /// use std::time::Duration;
+    ///
+    /// # fn main() -> Result<(), observable_property::PropertyError> {
+    /// let config = ObservableProperty::with_event_log("default".to_string(), 0);
+    ///
+    /// let start = std::time::Instant::now();
+    /// config.set("config_v1".to_string())?;
+    /// std::thread::sleep(Duration::from_millis(10));
+    /// config.set("config_v2".to_string())?;
+    /// std::thread::sleep(Duration::from_millis(10));
+    /// config.set("config_v3".to_string())?;
+    ///
+    /// // Find what the config was 15ms after start
+    /// let target_time = start + Duration::from_millis(15);
+    /// let events = config.get_event_log();
+    /// 
+    /// let mut state = "default".to_string();
+    /// for event in events {
+    ///     if event.timestamp <= target_time {
+    ///         state = event.new_value.clone();
+    ///     } else {
+    ///         break;
+    ///     }
+    /// }
+    /// 
+    /// println!("State at +15ms: {}", state);
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// ## Audit Trail with Thread Information
+    ///
+    /// ```rust
+    /// use observable_property::ObservableProperty;
+    /// use std::sync::Arc;
+    /// use std::thread;
+    ///
+    /// # fn main() -> Result<(), observable_property::PropertyError> {
+    /// let shared_state = Arc::new(ObservableProperty::with_event_log(0, 0));
+    ///
+    /// let handles: Vec<_> = (0..3)
+    ///     .map(|i| {
+    ///         let state = shared_state.clone();
+    ///         thread::spawn(move || {
+    ///             state.set(i * 10).expect("Failed to set");
+    ///         })
+    ///     })
+    ///     .collect();
+    ///
+    /// for handle in handles {
+    ///     handle.join().unwrap();
+    /// }
+    ///
+    /// // Examine which threads made changes
+    /// let events = shared_state.get_event_log();
+    /// for event in events {
+    ///     println!(
+    ///         "Event #{}: {} -> {} (thread: {})",
+    ///         event.event_number,
+    ///         event.old_value,
+    ///         event.new_value,
+    ///         event.thread_id
+    ///     );
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// ## Event Replay
+    ///
+    /// ```rust
+    /// use observable_property::ObservableProperty;
+    ///
+    /// # fn main() -> Result<(), observable_property::PropertyError> {
+    /// let account_balance = ObservableProperty::with_event_log(1000, 0);
+    ///
+    /// // Simulate transactions
+    /// account_balance.modify(|b| *b -= 100)?; // Withdrawal
+    /// account_balance.modify(|b| *b += 50)?;  // Deposit
+    /// account_balance.modify(|b| *b -= 200)?; // Withdrawal
+    ///
+    /// // Replay all transactions
+    /// let events = account_balance.get_event_log();
+    /// println!("Transaction History:");
+    /// for event in events {
+    ///     let change = event.new_value as i32 - event.old_value as i32;
+    ///     let transaction_type = if change > 0 { "Deposit" } else { "Withdrawal" };
+    ///     println!(
+    ///         "[{}] {}: ${} (balance: {} -> {})",
+    ///         event.event_number,
+    ///         transaction_type,
+    ///         change.abs(),
+    ///         event.old_value,
+    ///         event.new_value
+    ///     );
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Thread Safety
+    ///
+    /// Event logging is fully thread-safe and works correctly even when multiple
+    /// threads are modifying the property concurrently. Event numbers are assigned
+    /// sequentially based on the order changes complete (not the order they start).
+    ///
+    /// # Difference from History
+    ///
+    /// While `with_history()` only stores previous values, `with_event_log()` stores
+    /// complete event objects with timestamps and metadata. This makes event logs
+    /// more suitable for auditing and debugging, but they consume more memory.
+    ///
+    /// | Feature | `with_history()` | `with_event_log()` |
+    /// |---------|------------------|--------------------|
+    /// | Stores values | ✓ | ✓ |
+    /// | Stores timestamps | ✗ | ✓ |
+    /// | Stores thread info | ✗ | ✓ |
+    /// | Sequential numbering | ✗ | ✓ |
+    /// | Old + new values | ✗ | ✓ |
+    /// | Memory overhead | Low | Higher |
+    /// | Undo support | ✓ | ✗ (manual) |
+    pub fn with_event_log(initial_value: T, event_log_size: usize) -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(InnerProperty {
+                value: initial_value,
+                observers: HashMap::new(),
+                next_id: 0,
+                history: None,
+                history_size: 0,
+                total_changes: 0,
+                observer_calls: 0,
+                notification_times: Vec::new(),
+                #[cfg(feature = "debug")]
+                debug_logging_enabled: false,
+                #[cfg(feature = "debug")]
+                change_logs: Vec::new(),
+                batch_depth: 0,
+                batch_initial_value: None,
+                eq_fn: None,
+                validator: None,
+                event_log: Some(Vec::with_capacity(if event_log_size > 0 { event_log_size } else { 16 })),
+                event_log_size,
             })),
             max_threads: MAX_THREADS,
             max_observers: MAX_OBSERVERS,
@@ -2016,6 +2283,179 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
         }
     }
 
+    /// Gets the complete event log for this property
+    ///
+    /// Returns a vector of all recorded property change events. Each event contains
+    /// the old value, new value, timestamp, event number, and thread information.
+    /// This provides a complete audit trail of all changes to the property.
+    ///
+    /// This method acquires a read lock, allowing multiple concurrent readers.
+    /// The returned vector is independent of the property's internal state.
+    ///
+    /// # Returns
+    ///
+    /// A vector of `PropertyEvent<T>` objects, in chronological order (oldest first).
+    /// Returns an empty vector if:
+    /// - Event logging is not enabled (property not created with `with_event_log()`)
+    /// - No changes have been made yet
+    ///
+    /// # Examples
+    ///
+    /// ## Basic Event Log Retrieval
+    ///
+    /// ```rust
+    /// use observable_property::ObservableProperty;
+    ///
+    /// # fn main() -> Result<(), observable_property::PropertyError> {
+    /// let counter = ObservableProperty::with_event_log(0, 0);
+    ///
+    /// counter.set(1)?;
+    /// counter.set(2)?;
+    /// counter.set(3)?;
+    ///
+    /// let events = counter.get_event_log();
+    /// assert_eq!(events.len(), 3);
+    ///
+    /// // First event
+    /// assert_eq!(events[0].old_value, 0);
+    /// assert_eq!(events[0].new_value, 1);
+    /// assert_eq!(events[0].event_number, 0);
+    ///
+    /// // Last event
+    /// assert_eq!(events[2].old_value, 2);
+    /// assert_eq!(events[2].new_value, 3);
+    /// assert_eq!(events[2].event_number, 2);
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// ## Filtering Events by Time
+    ///
+    /// ```rust
+    /// use observable_property::ObservableProperty;
+    /// use std::time::{Duration, Instant};
+    ///
+    /// # fn main() -> Result<(), observable_property::PropertyError> {
+    /// let property = ObservableProperty::with_event_log(0, 0);
+    /// let start = Instant::now();
+    ///
+    /// property.set(1)?;
+    /// std::thread::sleep(Duration::from_millis(10));
+    /// property.set(2)?;
+    /// std::thread::sleep(Duration::from_millis(10));
+    /// property.set(3)?;
+    ///
+    /// let cutoff = start + Duration::from_millis(15);
+    /// let recent_events: Vec<_> = property.get_event_log()
+    ///     .into_iter()
+    ///     .filter(|e| e.timestamp > cutoff)
+    ///     .collect();
+    ///
+    /// println!("Recent events: {}", recent_events.len());
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// ## Analyzing Event Patterns
+    ///
+    /// ```rust
+    /// use observable_property::ObservableProperty;
+    ///
+    /// # fn main() -> Result<(), observable_property::PropertyError> {
+    /// let score = ObservableProperty::with_event_log(0, 0);
+    ///
+    /// score.modify(|s| *s += 10)?;
+    /// score.modify(|s| *s -= 3)?;
+    /// score.modify(|s| *s += 5)?;
+    ///
+    /// let events = score.get_event_log();
+    /// let total_increases = events.iter()
+    ///     .filter(|e| e.new_value > e.old_value)
+    ///     .count();
+    /// let total_decreases = events.iter()
+    ///     .filter(|e| e.new_value < e.old_value)
+    ///     .count();
+    ///
+    /// println!("Increases: {}, Decreases: {}", total_increases, total_decreases);
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// ## Event Log with Thread Information
+    ///
+    /// ```rust
+    /// use observable_property::ObservableProperty;
+    /// use std::sync::Arc;
+    /// use std::thread;
+    ///
+    /// # fn main() -> Result<(), observable_property::PropertyError> {
+    /// let property = Arc::new(ObservableProperty::with_event_log(0, 0));
+    ///
+    /// let handles: Vec<_> = (0..3).map(|i| {
+    ///     let prop = property.clone();
+    ///     thread::spawn(move || {
+    ///         prop.set(i * 10).expect("Set failed");
+    ///     })
+    /// }).collect();
+    ///
+    /// for handle in handles {
+    ///     handle.join().unwrap();
+    /// }
+    ///
+    /// // Analyze which threads made changes
+    /// for event in property.get_event_log() {
+    ///     println!("Event {}: Thread {}", event.event_number, event.thread_id);
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// ## Replaying Property State
+    ///
+    /// ```rust
+    /// use observable_property::ObservableProperty;
+    ///
+    /// # fn main() -> Result<(), observable_property::PropertyError> {
+    /// let property = ObservableProperty::with_event_log(100, 0);
+    ///
+    /// property.set(150)?;
+    /// property.set(200)?;
+    /// property.set(175)?;
+    ///
+    /// // Replay state at each point in time
+    /// let events = property.get_event_log();
+    /// let mut state = 100; // Initial value
+    /// 
+    /// println!("Initial state: {}", state);
+    /// for event in events {
+    ///     state = event.new_value;
+    ///     println!("After event {}: {}", event.event_number, state);
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Thread Safety
+    ///
+    /// This method is thread-safe and can be called concurrently from multiple threads.
+    /// The returned event log is a snapshot at the time of the call.
+    ///
+    /// # Performance
+    ///
+    /// This method clones the entire event log. For properties with large event logs,
+    /// consider the memory and performance implications. If you only need recent events,
+    /// use filtering on the result or create the property with a bounded `event_log_size`.
+    pub fn get_event_log(&self) -> Vec<PropertyEvent<T>> {
+        match self.inner.read() {
+            Ok(prop) => prop.event_log.as_ref().map_or(Vec::new(), |log| log.clone()),
+            Err(poisoned) => {
+                // Graceful degradation: recover from poisoned lock
+                let prop = poisoned.into_inner();
+                prop.event_log.as_ref().map_or(Vec::new(), |log| log.clone())
+            }
+        }
+    }
+
     /// Gets the current value of the property
     ///
     /// This method acquires a read lock, which allows multiple concurrent readers
@@ -2216,6 +2656,7 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
             
             // Track the change
             prop.total_changes += 1;
+            let event_num = prop.total_changes - 1; // Capture for event numbering
             
             // Add old value to history if history tracking is enabled
             let history_size = prop.history_size;
@@ -2227,6 +2668,26 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
                 if history.len() > history_size {
                     let overflow = history.len() - history_size;
                     history.drain(0..overflow);
+                }
+            }
+            
+            // Record event if event logging is enabled
+            let event_log_size = prop.event_log_size;
+            if let Some(event_log) = &mut prop.event_log {
+                let event = PropertyEvent {
+                    timestamp: Instant::now(),
+                    old_value: old_value.clone(),
+                    new_value: new_value.clone(),
+                    event_number: event_num, // Use captured event number for consistent numbering
+                    thread_id: format!("{:?}", thread::current().id()),
+                };
+                
+                event_log.push(event);
+                
+                // Enforce event log size limit by removing oldest events (if bounded)
+                if event_log_size > 0 && event_log.len() > event_log_size {
+                    let overflow = event_log.len() - event_log_size;
+                    event_log.drain(0..overflow);
                 }
             }
             
@@ -2459,6 +2920,7 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
             
             // Track the change
             prop.total_changes += 1;
+            let event_num = prop.total_changes - 1; // Capture for event numbering
             
             // Add old value to history if history tracking is enabled
             let history_size = prop.history_size;
@@ -2470,6 +2932,26 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
                 if history.len() > history_size {
                     let overflow = history.len() - history_size;
                     history.drain(0..overflow);
+                }
+            }
+            
+            // Record event if event logging is enabled
+            let event_log_size = prop.event_log_size;
+            if let Some(event_log) = &mut prop.event_log {
+                let event = PropertyEvent {
+                    timestamp: Instant::now(),
+                    old_value: old_value.clone(),
+                    new_value: new_value.clone(),
+                    event_number: event_num, // Use captured event number for consistent numbering
+                    thread_id: format!("{:?}", thread::current().id()),
+                };
+                
+                event_log.push(event);
+                
+                // Enforce event log size limit by removing oldest events (if bounded)
+                if event_log_size > 0 && event_log.len() > event_log_size {
+                    let overflow = event_log.len() - event_log_size;
+                    event_log.drain(0..overflow);
                 }
             }
             
@@ -4057,6 +4539,8 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
                 batch_initial_value: None,
                 eq_fn: None,
                 validator: None,
+                event_log: None,
+                event_log_size: 0,
             })),
             max_threads: if max_threads == 0 { MAX_THREADS } else { max_threads },
             max_observers: if max_observers == 0 { MAX_OBSERVERS } else { max_observers },
@@ -4199,6 +4683,10 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
                 return Ok(());
             }
             
+            // Track the change
+            prop.total_changes += 1;
+            let event_num = prop.total_changes - 1; // Capture for event numbering
+            
             // Add old value to history if history tracking is enabled
             let history_size = prop.history_size;
             if let Some(history) = &mut prop.history {
@@ -4209,6 +4697,26 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
                 if history.len() > history_size {
                     let overflow = history.len() - history_size;
                     history.drain(0..overflow);
+                }
+            }
+            
+            // Record event if event logging is enabled
+            let event_log_size = prop.event_log_size;
+            if let Some(event_log) = &mut prop.event_log {
+                let event = PropertyEvent {
+                    timestamp: Instant::now(),
+                    old_value: old_value.clone(),
+                    new_value: new_value.clone(),
+                    event_number: event_num, // Use captured event number for consistent numbering
+                    thread_id: format!("{:?}", thread::current().id()),
+                };
+                
+                event_log.push(event);
+                
+                // Enforce event log size limit by removing oldest events (if bounded)
+                if event_log_size > 0 && event_log.len() > event_log_size {
+                    let overflow = event_log.len() - event_log_size;
+                    event_log.drain(0..overflow);
                 }
             }
             
