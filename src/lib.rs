@@ -432,6 +432,11 @@ pub enum PropertyError {
         /// Description of the persistence error
         reason: String,
     },
+    /// Attempted to undo when no history is available
+    NoHistory {
+        /// Description of the issue
+        reason: String,
+    },
 }
 
 impl fmt::Display for PropertyError {
@@ -463,6 +468,9 @@ impl fmt::Display for PropertyError {
             }
             PropertyError::PersistenceError { reason } => {
                 write!(f, "Persistence failed: {}", reason)
+            }
+            PropertyError::NoHistory { reason } => {
+                write!(f, "No history available: {}", reason)
             }
         }
     }
@@ -714,6 +722,8 @@ where
     value: T,
     observers: HashMap<ObserverId, ObserverRef<T>>,
     next_id: ObserverId,
+    history: Option<Vec<T>>,
+    history_size: usize,
 }
 
 impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
@@ -740,6 +750,8 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
                 value: initial_value,
                 observers: HashMap::new(),
                 next_id: 0,
+                history: None,
+                history_size: 0,
             })),
             max_threads: MAX_THREADS,
             max_observers: MAX_OBSERVERS,
@@ -832,6 +844,8 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
                 value: initial_value,
                 observers: HashMap::new(),
                 next_id: 0,
+                history: None,
+                history_size: 0,
             })),
             max_threads,
             max_observers: MAX_OBSERVERS,
@@ -1003,6 +1017,488 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
         property
     }
 
+    /// Creates a new observable property with history tracking enabled
+    ///
+    /// This constructor creates a property that maintains a history of previous values,
+    /// allowing you to undo changes and view historical values. The history buffer is
+    /// automatically managed with a fixed size limit.
+    ///
+    /// # Arguments
+    ///
+    /// * `initial_value` - The starting value for this property
+    /// * `history_size` - Maximum number of previous values to retain in history.
+    ///   If 0, history tracking is disabled and behaves like a regular property.
+    ///
+    /// # History Behavior
+    ///
+    /// - The history buffer stores up to `history_size` previous values
+    /// - When the buffer is full, the oldest value is removed when a new value is added
+    /// - The current value is **not** included in the history - only past values
+    /// - History is stored in chronological order (oldest to newest)
+    /// - Undo operations pop values from the history and restore them as current
+    ///
+    /// # Memory Considerations
+    ///
+    /// Each historical value requires memory equivalent to `size_of::<T>()`. For large
+    /// types or high history sizes, consider:
+    /// - Using smaller history_size values
+    /// - Wrapping large types in `Arc<T>` to share data between history entries
+    /// - Implementing custom equality checks to avoid storing duplicate values
+    ///
+    /// # Examples
+    ///
+    /// ## Basic History Usage
+    ///
+    /// ```rust
+    /// use observable_property::ObservableProperty;
+    ///
+    /// # fn main() -> Result<(), observable_property::PropertyError> {
+    /// // Create property with space for 5 historical values
+    /// let property = ObservableProperty::with_history(0, 5);
+    ///
+    /// // Make some changes
+    /// property.set(10)?;
+    /// property.set(20)?;
+    /// property.set(30)?;
+    ///
+    /// assert_eq!(property.get()?, 30);
+    ///
+    /// // Undo last change
+    /// property.undo()?;
+    /// assert_eq!(property.get()?, 20);
+    ///
+    /// // Undo again
+    /// property.undo()?;
+    /// assert_eq!(property.get()?, 10);
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// ## View History
+    ///
+    /// ```rust
+    /// use observable_property::ObservableProperty;
+    ///
+    /// # fn main() -> Result<(), observable_property::PropertyError> {
+    /// let property = ObservableProperty::with_history("start".to_string(), 3);
+    ///
+    /// property.set("second".to_string())?;
+    /// property.set("third".to_string())?;
+    /// property.set("fourth".to_string())?;
+    ///
+    /// // Get all historical values (oldest to newest)
+    /// let history = property.get_history();
+    /// assert_eq!(history.len(), 3);
+    /// assert_eq!(history[0], "start");   // oldest
+    /// assert_eq!(history[1], "second");
+    /// assert_eq!(history[2], "third");   // newest (most recent past value)
+    ///
+    /// // Current value is "fourth" and not in history
+    /// assert_eq!(property.get()?, "fourth");
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// ## History with Observer Pattern
+    ///
+    /// ```rust
+    /// use observable_property::ObservableProperty;
+    /// use std::sync::Arc;
+    ///
+    /// # fn main() -> Result<(), observable_property::PropertyError> {
+    /// let property = ObservableProperty::with_history(100, 10);
+    ///
+    /// // Observers work normally with history-enabled properties
+    /// let _subscription = property.subscribe_with_subscription(Arc::new(|old, new| {
+    ///     println!("Value changed: {} -> {}", old, new);
+    /// }))?;
+    ///
+    /// property.set(200)?; // Triggers observer
+    /// property.undo()?;   // Also triggers observer when reverting to 100
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// ## Bounded History Buffer
+    ///
+    /// ```rust
+    /// use observable_property::ObservableProperty;
+    ///
+    /// # fn main() -> Result<(), observable_property::PropertyError> {
+    /// // Only keep 2 historical values
+    /// let property = ObservableProperty::with_history(1, 2);
+    ///
+    /// property.set(2)?;  // history: [1]
+    /// property.set(3)?;  // history: [1, 2]
+    /// property.set(4)?;  // history: [2, 3] (oldest '1' was removed)
+    ///
+    /// let history = property.get_history();
+    /// assert_eq!(history, vec![2, 3]);
+    /// assert_eq!(property.get()?, 4);
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Thread Safety
+    ///
+    /// History tracking is fully thread-safe and works correctly even when multiple
+    /// threads are calling `set()`, `undo()`, and `get_history()` concurrently.
+    pub fn with_history(initial_value: T, history_size: usize) -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(InnerProperty {
+                value: initial_value,
+                observers: HashMap::new(),
+                next_id: 0,
+                history: if history_size > 0 {
+                    Some(Vec::with_capacity(history_size))
+                } else {
+                    None
+                },
+                history_size,
+            })),
+            max_threads: MAX_THREADS,
+            max_observers: MAX_OBSERVERS,
+        }
+    }
+
+    /// Reverts the property to its previous value from history
+    ///
+    /// This method pops the most recent value from the history buffer and makes it
+    /// the current value. The current value is **not** added to history during undo.
+    /// All subscribed observers are notified of this change.
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(())` if the undo was successful
+    /// - `Err(PropertyError::NoHistory)` if:
+    ///   - History tracking is not enabled (created without `with_history()`)
+    ///   - History buffer is empty (no previous values to restore)
+    ///
+    /// # Undo Chain Behavior
+    ///
+    /// Consecutive undo operations walk back through history until exhausted:
+    /// ```text
+    /// Initial: value=4, history=[1, 2, 3]
+    /// After undo(): value=3, history=[1, 2]
+    /// After undo(): value=2, history=[1]
+    /// After undo(): value=1, history=[]
+    /// After undo(): Error(NoHistory) - no more history
+    /// ```
+    ///
+    /// # Observer Notification
+    ///
+    /// Observers are notified with the current value as "old" and the restored
+    /// historical value as "new", maintaining the same notification pattern as `set()`.
+    ///
+    /// # Examples
+    ///
+    /// ## Basic Undo
+    ///
+    /// ```rust
+    /// use observable_property::ObservableProperty;
+    ///
+    /// # fn main() -> Result<(), observable_property::PropertyError> {
+    /// let property = ObservableProperty::with_history(1, 5);
+    ///
+    /// property.set(2)?;
+    /// property.set(3)?;
+    /// assert_eq!(property.get()?, 3);
+    ///
+    /// property.undo()?;
+    /// assert_eq!(property.get()?, 2);
+    ///
+    /// property.undo()?;
+    /// assert_eq!(property.get()?, 1);
+    ///
+    /// // No more history
+    /// assert!(property.undo().is_err());
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// ## Undo with Observers
+    ///
+    /// ```rust
+    /// use observable_property::ObservableProperty;
+    /// use std::sync::Arc;
+    ///
+    /// # fn main() -> Result<(), observable_property::PropertyError> {
+    /// let property = ObservableProperty::with_history(10, 5);
+    ///
+    /// let _subscription = property.subscribe_with_subscription(Arc::new(|old, new| {
+    ///     println!("Changed from {} to {}", old, new);
+    /// }))?;
+    ///
+    /// property.set(20)?; // Prints: "Changed from 10 to 20"
+    /// property.undo()?;  // Prints: "Changed from 20 to 10"
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// ## Error Handling
+    ///
+    /// ```rust
+    /// use observable_property::{ObservableProperty, PropertyError};
+    ///
+    /// # fn main() -> Result<(), PropertyError> {
+    /// // Property without history
+    /// let no_history = ObservableProperty::new(42);
+    /// match no_history.undo() {
+    ///     Err(PropertyError::NoHistory { .. }) => {
+    ///         println!("Expected: history not enabled");
+    ///     }
+    ///     _ => panic!("Should fail without history"),
+    /// }
+    ///
+    /// // Property with history but empty
+    /// let empty_history = ObservableProperty::with_history(100, 5);
+    /// match empty_history.undo() {
+    ///     Err(PropertyError::NoHistory { .. }) => {
+    ///         println!("Expected: no history to undo");
+    ///     }
+    ///     _ => panic!("Should fail with empty history"),
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// ## Undo After Multiple Changes
+    ///
+    /// ```rust
+    /// use observable_property::ObservableProperty;
+    ///
+    /// # fn main() -> Result<(), observable_property::PropertyError> {
+    /// let counter = ObservableProperty::with_history(0, 3);
+    ///
+    /// // Make several changes
+    /// for i in 1..=5 {
+    ///     counter.set(i)?;
+    /// }
+    ///
+    /// assert_eq!(counter.get()?, 5);
+    ///
+    /// // Undo three times (limited by history_size=3)
+    /// counter.undo()?;
+    /// assert_eq!(counter.get()?, 4);
+    ///
+    /// counter.undo()?;
+    /// assert_eq!(counter.get()?, 3);
+    ///
+    /// counter.undo()?;
+    /// assert_eq!(counter.get()?, 2);
+    ///
+    /// // No more history (oldest value in buffer was 2)
+    /// assert!(counter.undo().is_err());
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Thread Safety
+    ///
+    /// This method is thread-safe and can be called concurrently with `set()`,
+    /// `get()`, and other operations from multiple threads.
+    pub fn undo(&self) -> Result<(), PropertyError> {
+        let (old_value, new_value, observers_snapshot, dead_observer_ids) = {
+            let mut prop = match self.inner.write() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+
+            // Check if history is enabled and has values
+            let history = prop.history.as_mut().ok_or_else(|| PropertyError::NoHistory {
+                reason: "History tracking is not enabled for this property".to_string(),
+            })?;
+
+            if history.is_empty() {
+                return Err(PropertyError::NoHistory {
+                    reason: "No history available to undo".to_string(),
+                });
+            }
+
+            // Pop the most recent historical value
+            let previous_value = history.pop().unwrap();
+            let old_value = mem::replace(&mut prop.value, previous_value.clone());
+
+            // Collect active observers (same pattern as set())
+            let mut observers_snapshot = Vec::new();
+            let mut dead_ids = Vec::new();
+            for (id, observer_ref) in &prop.observers {
+                if let Some(observer) = observer_ref.try_call() {
+                    observers_snapshot.push(observer);
+                } else {
+                    dead_ids.push(*id);
+                }
+            }
+
+            (old_value, previous_value, observers_snapshot, dead_ids)
+        };
+
+        // Notify all active observers
+        for observer in observers_snapshot {
+            if let Err(e) = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+                observer(&old_value, &new_value);
+            })) {
+                eprintln!("Observer panic during undo: {:?}", e);
+            }
+        }
+
+        // Clean up dead weak observers
+        if !dead_observer_ids.is_empty() {
+            let mut prop = match self.inner.write() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            for id in dead_observer_ids {
+                prop.observers.remove(&id);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Returns a snapshot of all historical values
+    ///
+    /// This method returns a vector containing all previous values currently stored
+    /// in the history buffer, ordered from oldest to newest. The current value is
+    /// **not** included in the returned vector.
+    ///
+    /// # Returns
+    ///
+    /// A `Vec<T>` containing historical values in chronological order:
+    /// - `vec[0]` is the oldest value in history
+    /// - `vec[len-1]` is the most recent past value (the one that would be restored by `undo()`)
+    /// - Empty vector if history is disabled or no history has been recorded
+    ///
+    /// # Memory
+    ///
+    /// This method clones all historical values, so the returned vector owns its data
+    /// independently of the property. This allows safe sharing across threads without
+    /// holding locks.
+    ///
+    /// # Examples
+    ///
+    /// ## Basic History Retrieval
+    ///
+    /// ```rust
+    /// use observable_property::ObservableProperty;
+    ///
+    /// # fn main() -> Result<(), observable_property::PropertyError> {
+    /// let property = ObservableProperty::with_history("a".to_string(), 5);
+    ///
+    /// property.set("b".to_string())?;
+    /// property.set("c".to_string())?;
+    /// property.set("d".to_string())?;
+    ///
+    /// let history = property.get_history();
+    /// assert_eq!(history.len(), 3);
+    /// assert_eq!(history[0], "a"); // oldest
+    /// assert_eq!(history[1], "b");
+    /// assert_eq!(history[2], "c"); // newest (what undo() would restore)
+    ///
+    /// // Current value is not in history
+    /// assert_eq!(property.get()?, "d");
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// ## Empty History
+    ///
+    /// ```rust
+    /// use observable_property::ObservableProperty;
+    ///
+    /// // No history recorded yet
+    /// let fresh = ObservableProperty::with_history(42, 10);
+    /// assert!(fresh.get_history().is_empty());
+    ///
+    /// // History disabled (size = 0)
+    /// let no_tracking = ObservableProperty::with_history(42, 0);
+    /// assert!(no_tracking.get_history().is_empty());
+    ///
+    /// // Regular property (no history support)
+    /// let regular = ObservableProperty::new(42);
+    /// assert!(regular.get_history().is_empty());
+    /// ```
+    ///
+    /// ## History Buffer Limit
+    ///
+    /// ```rust
+    /// use observable_property::ObservableProperty;
+    ///
+    /// # fn main() -> Result<(), observable_property::PropertyError> {
+    /// // Limited history size
+    /// let property = ObservableProperty::with_history(1, 3);
+    ///
+    /// for i in 2..=6 {
+    ///     property.set(i)?;
+    /// }
+    ///
+    /// // Only last 3 historical values are kept
+    /// let history = property.get_history();
+    /// assert_eq!(history, vec![3, 4, 5]);
+    /// assert_eq!(property.get()?, 6); // current
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// ## Iterating Through History
+    ///
+    /// ```rust
+    /// use observable_property::ObservableProperty;
+    ///
+    /// # fn main() -> Result<(), observable_property::PropertyError> {
+    /// let property = ObservableProperty::with_history(0.0f64, 5);
+    ///
+    /// property.set(1.5)?;
+    /// property.set(3.0)?;
+    /// property.set(4.5)?;
+    ///
+    /// println!("Historical values:");
+    /// for (i, value) in property.get_history().iter().enumerate() {
+    ///     println!("  [{}] {}", i, value);
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// ## Checking History Before Undo
+    ///
+    /// ```rust
+    /// use observable_property::ObservableProperty;
+    ///
+    /// # fn main() -> Result<(), observable_property::PropertyError> {
+    /// let property = ObservableProperty::with_history(100, 5);
+    /// property.set(200)?;
+    /// property.set(300)?;
+    ///
+    /// // Check what undo would restore
+    /// let history = property.get_history();
+    /// if !history.is_empty() {
+    ///     let would_restore = history.last().unwrap();
+    ///     println!("Undo would restore: {}", would_restore);
+    ///     
+    ///     // Actually perform the undo
+    ///     property.undo()?;
+    ///     assert_eq!(property.get()?, *would_restore);
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Thread Safety
+    ///
+    /// This method acquires a read lock, allowing multiple concurrent readers.
+    /// The returned vector is independent of the property's internal state.
+    pub fn get_history(&self) -> Vec<T> {
+        match self.inner.read() {
+            Ok(prop) => prop.history.as_ref().map_or(Vec::new(), |h| h.clone()),
+            Err(poisoned) => {
+                // Graceful degradation: recover from poisoned lock
+                let prop = poisoned.into_inner();
+                prop.history.as_ref().map_or(Vec::new(), |h| h.clone())
+            }
+        }
+    }
+
     /// Gets the current value of the property
     ///
     /// This method acquires a read lock, which allows multiple concurrent readers
@@ -1088,6 +1584,19 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
 
             // Performance optimization: use mem::replace to avoid one clone operation
             let old_value = mem::replace(&mut prop.value, new_value.clone());
+            
+            // Add old value to history if history tracking is enabled
+            let history_size = prop.history_size;
+            if let Some(history) = &mut prop.history {
+                // Add old value to history
+                history.push(old_value.clone());
+                
+                // Enforce history size limit by removing oldest values
+                if history.len() > history_size {
+                    let overflow = history.len() - history_size;
+                    history.drain(0..overflow);
+                }
+            }
             
             // Collect active observers and track dead weak observers
             let mut observers_snapshot = Vec::new();
@@ -1268,6 +1777,19 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
 
             // Performance optimization: use mem::replace to avoid one clone operation
             let old_value = mem::replace(&mut prop.value, new_value.clone());
+            
+            // Add old value to history if history tracking is enabled
+            let history_size = prop.history_size;
+            if let Some(history) = &mut prop.history {
+                // Add old value to history
+                history.push(old_value.clone());
+                
+                // Enforce history size limit by removing oldest values
+                if history.len() > history_size {
+                    let overflow = history.len() - history_size;
+                    history.drain(0..overflow);
+                }
+            }
             
             // Collect active observers and track dead weak observers
             let mut observers_snapshot = Vec::new();
@@ -2625,6 +3147,8 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
                 value: initial_value,
                 observers: HashMap::new(),
                 next_id: 0,
+                history: None,
+                history_size: 0,
             })),
             max_threads: if max_threads == 0 { MAX_THREADS } else { max_threads },
             max_observers: if max_observers == 0 { MAX_OBSERVERS } else { max_observers },
@@ -2745,6 +3269,19 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
             let old_value = prop.value.clone();
             f(&mut prop.value);
             let new_value = prop.value.clone();
+            
+            // Add old value to history if history tracking is enabled
+            let history_size = prop.history_size;
+            if let Some(history) = &mut prop.history {
+                // Add old value to history
+                history.push(old_value.clone());
+                
+                // Enforce history size limit by removing oldest values
+                if history.len() > history_size {
+                    let overflow = history.len() - history_size;
+                    history.drain(0..overflow);
+                }
+            }
             
             // Collect active observers and track dead weak observers
             let mut observers = Vec::new();
@@ -2952,6 +3489,19 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
             // Otherwise, restore the original value (ignore any in-place modifications)
             if let Some(final_state) = states.last() {
                 prop.value = final_state.clone();
+                
+                // Add initial value to history if history tracking is enabled
+                // Note: We only track the pre-batch initial value, not intermediates
+                let history_size = prop.history_size;
+                if let Some(history) = &mut prop.history {
+                    history.push(initial_value.clone());
+                    
+                    // Enforce history size limit by removing oldest values
+                    if history.len() > history_size {
+                        let overflow = history.len() - history_size;
+                        history.drain(0..overflow);
+                    }
+                }
             } else {
                 prop.value = initial_value.clone();
             }
