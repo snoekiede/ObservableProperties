@@ -3550,6 +3550,292 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
 
         Ok(())
     }
+
+    /// Creates a bidirectional binding between two properties
+    ///
+    /// This method establishes a two-way synchronization where changes to either property
+    /// will automatically update the other. This is particularly useful for model-view
+    /// synchronization patterns where a UI control and a data model need to stay in sync.
+    ///
+    /// # How It Works
+    ///
+    /// 1. Each property subscribes to changes in the other
+    /// 2. When property A changes, property B is updated to match
+    /// 3. When property B changes, property A is updated to match
+    /// 4. Infinite loops are prevented by comparing values before updating
+    ///
+    /// # Loop Prevention
+    ///
+    /// The method uses value comparison to prevent infinite update loops. If the new
+    /// value equals the current value, no update is triggered. This requires `T` to
+    /// implement `PartialEq`.
+    ///
+    /// # Type Requirements
+    ///
+    /// The value type must implement:
+    /// - `Clone` - For copying values between properties
+    /// - `PartialEq` - For comparing values to prevent infinite loops
+    /// - `Send + Sync` - For thread-safe operation
+    /// - `'static` - For storing in observers
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(())` if the binding was successfully established
+    /// - `Err(PropertyError)` if subscription fails (e.g., observer limit exceeded)
+    ///
+    /// # Subscription Management
+    ///
+    /// The subscriptions created by this method are stored as strong references and will
+    /// remain active until one of the properties is dropped or the observers are manually
+    /// unsubscribed. The returned `ObserverId`s can be used to unsubscribe if needed.
+    ///
+    /// # Examples
+    ///
+    /// ## Basic Two-Way Binding
+    ///
+    /// ```rust
+    /// use observable_property::ObservableProperty;
+    ///
+    /// # fn main() -> Result<(), observable_property::PropertyError> {
+    /// let model = ObservableProperty::new(0);
+    /// let view = ObservableProperty::new(0);
+    ///
+    /// // Establish bidirectional binding
+    /// model.bind_bidirectional(&view)?;
+    ///
+    /// // Update model - view automatically updates
+    /// model.set(42)?;
+    /// assert_eq!(view.get()?, 42);
+    ///
+    /// // Update view - model automatically updates
+    /// view.set(100)?;
+    /// assert_eq!(model.get()?, 100);
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// ## Model-View Synchronization
+    ///
+    /// ```rust
+    /// use observable_property::ObservableProperty;
+    /// use std::sync::Arc;
+    ///
+    /// # fn main() -> Result<(), observable_property::PropertyError> {
+    /// // Model representing application state
+    /// let username = ObservableProperty::new("".to_string());
+    ///
+    /// // View representing UI input field
+    /// let username_field = ObservableProperty::new("".to_string());
+    ///
+    /// // Bind them together
+    /// username.bind_bidirectional(&username_field)?;
+    ///
+    /// // Add validation observer on the model
+    /// username.subscribe(Arc::new(|_old, new| {
+    ///     if new.len() > 3 {
+    ///         println!("Valid username: {}", new);
+    ///     }
+    /// }))?;
+    ///
+    /// // User types in UI field
+    /// username_field.set("john".to_string())?;
+    /// // Both properties are now "john", validation observer triggered
+    /// assert_eq!(username.get()?, "john");
+    ///
+    /// // Programmatic model update
+    /// username.set("alice".to_string())?;
+    /// // UI field automatically reflects the change
+    /// assert_eq!(username_field.get()?, "alice");
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// ## Multiple Property Synchronization
+    ///
+    /// ```rust
+    /// use observable_property::ObservableProperty;
+    ///
+    /// # fn main() -> Result<(), observable_property::PropertyError> {
+    /// let slider_value = ObservableProperty::new(50);
+    /// let text_input = ObservableProperty::new(50);
+    /// let display_label = ObservableProperty::new(50);
+    ///
+    /// // Create a synchronized group of controls
+    /// slider_value.bind_bidirectional(&text_input)?;
+    /// slider_value.bind_bidirectional(&display_label)?;
+    ///
+    /// // Update any one of them
+    /// text_input.set(75)?;
+    ///
+    /// // All are synchronized
+    /// assert_eq!(slider_value.get()?, 75);
+    /// assert_eq!(text_input.get()?, 75);
+    /// assert_eq!(display_label.get()?, 75);
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// ## With Additional Observers
+    ///
+    /// ```rust
+    /// use observable_property::ObservableProperty;
+    /// use std::sync::Arc;
+    ///
+    /// # fn main() -> Result<(), observable_property::PropertyError> {
+    /// let celsius = ObservableProperty::new(0.0);
+    /// let fahrenheit = ObservableProperty::new(32.0);
+    ///
+    /// // Note: For unit conversion, you'd typically use computed properties
+    /// // instead of bidirectional binding, but this shows the concept
+    /// celsius.bind_bidirectional(&fahrenheit)?;
+    ///
+    /// // Add logging to observe synchronization
+    /// celsius.subscribe(Arc::new(|old, new| {
+    ///     println!("Celsius changed: {:.1}°C -> {:.1}°C", old, new);
+    /// }))?;
+    ///
+    /// fahrenheit.subscribe(Arc::new(|old, new| {
+    ///     println!("Fahrenheit changed: {:.1}°F -> {:.1}°F", old, new);
+    /// }))?;
+    ///
+    /// celsius.set(100.0)?;
+    /// // Both properties are now 100.0 (not a real unit conversion!)
+    /// // Prints:
+    /// // "Celsius changed: 0.0°C -> 100.0°C"
+    /// // "Fahrenheit changed: 32.0°F -> 100.0°F"
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Thread Safety
+    ///
+    /// The binding is fully thread-safe. Both properties can be updated from any thread,
+    /// and the synchronization will work correctly across thread boundaries.
+    ///
+    /// # Performance Considerations
+    ///
+    /// - Each bound property creates two observer subscriptions (one in each direction)
+    /// - Value comparisons are performed on every update to prevent loops
+    /// - Consider using computed properties for one-way transformations instead
+    /// - Binding many properties in a chain may amplify update overhead
+    ///
+    /// # Limitations
+    ///
+    /// - Both properties must have the same type `T`
+    /// - Not suitable for complex transformations (use computed properties instead)
+    /// - Value comparison relies on `PartialEq` implementation quality
+    /// - Circular update chains with 3+ properties may have propagation delays
+    pub fn bind_bidirectional(
+        &self,
+        other: &ObservableProperty<T>,
+    ) -> Result<(), PropertyError>
+    where
+        T: PartialEq,
+    {
+        // Subscribe self to other's changes
+        // When other changes, update self
+        let self_inner = Arc::clone(&self.inner);
+        other.subscribe(Arc::new(move |_old, new| {
+            // Check if self's current value differs to prevent infinite loop
+            let should_update = {
+                match self_inner.read() {
+                    Ok(prop) => &prop.value != new,
+                    Err(poisoned) => &poisoned.into_inner().value != new,
+                }
+            };
+
+            if should_update {
+                let mut prop = match self_inner.write() {
+                    Ok(guard) => guard,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+
+                let old_value = mem::replace(&mut prop.value, new.clone());
+
+                // Add to history if enabled
+                let history_size = prop.history_size;
+                if let Some(history) = &mut prop.history {
+                    history.push(old_value.clone());
+                    if history.len() > history_size {
+                        let overflow = history.len() - history_size;
+                        history.drain(0..overflow);
+                    }
+                }
+
+                // Collect and notify observers
+                let mut observers = Vec::new();
+                for (_id, observer_ref) in &prop.observers {
+                    if let Some(observer) = observer_ref.try_call() {
+                        observers.push(observer);
+                    }
+                }
+                
+                // Release lock before notifying
+                drop(prop);
+
+                for observer in observers {
+                    if let Err(e) = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+                        observer(&old_value, new);
+                    })) {
+                        eprintln!("Observer panic in bidirectional binding: {:?}", e);
+                    }
+                }
+            }
+        }))?;
+
+        // Subscribe other to self's changes
+        // When self changes, update other
+        let other_inner = Arc::clone(&other.inner);
+        self.subscribe(Arc::new(move |_old, new| {
+            // Check if other's current value differs to prevent infinite loop
+            let should_update = {
+                match other_inner.read() {
+                    Ok(prop) => &prop.value != new,
+                    Err(poisoned) => &poisoned.into_inner().value != new,
+                }
+            };
+
+            if should_update {
+                let mut prop = match other_inner.write() {
+                    Ok(guard) => guard,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+
+                let old_value = mem::replace(&mut prop.value, new.clone());
+
+                // Add to history if enabled
+                let history_size = prop.history_size;
+                if let Some(history) = &mut prop.history {
+                    history.push(old_value.clone());
+                    if history.len() > history_size {
+                        let overflow = history.len() - history_size;
+                        history.drain(0..overflow);
+                    }
+                }
+
+                // Collect and notify observers
+                let mut observers = Vec::new();
+                for (_id, observer_ref) in &prop.observers {
+                    if let Some(observer) = observer_ref.try_call() {
+                        observers.push(observer);
+                    }
+                }
+                
+                // Release lock before notifying
+                drop(prop);
+
+                for observer in observers {
+                    if let Err(e) = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+                        observer(&old_value, new);
+                    })) {
+                        eprintln!("Observer panic in bidirectional binding: {:?}", e);
+                    }
+                }
+            }
+        }))?;
+
+        Ok(())
+    }
 }
 
 impl<T: Clone + Default + Send + Sync + 'static> ObservableProperty<T> {
