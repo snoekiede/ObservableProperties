@@ -2347,6 +2347,250 @@ impl<T: Clone + std::fmt::Debug + Send + Sync + 'static> std::fmt::Debug for Obs
     }
 }
 
+/// Creates a computed property that automatically recomputes when any dependency changes
+///
+/// A computed property is a special type of `ObservableProperty` whose value is derived
+/// from one or more other observable properties (dependencies). When any dependency changes,
+/// the computed property automatically recalculates its value and notifies its own observers.
+///
+/// # Type Parameters
+///
+/// * `T` - The type of the dependency properties
+/// * `U` - The type of the computed property's value
+/// * `F` - The compute function type
+///
+/// # Arguments
+///
+/// * `dependencies` - A vector of `Arc<ObservableProperty<T>>` that this computed property depends on
+/// * `compute_fn` - A function that takes a slice of current dependency values and returns the computed value
+///
+/// # Returns
+///
+/// An `Arc<ObservableProperty<U>>` that will automatically update when any dependency changes.
+/// Returns an error if subscribing to dependencies fails.
+///
+/// # How It Works
+///
+/// 1. Creates a new `ObservableProperty<U>` with the initial computed value
+/// 2. Subscribes to each dependency property
+/// 3. When any dependency changes, recomputes the value using all current dependency values
+/// 4. Updates the computed property, which triggers its own observers
+///
+/// # Examples
+///
+/// ## Basic Math Computation
+///
+/// ```rust
+/// use observable_property::{ObservableProperty, computed};
+/// use std::sync::Arc;
+///
+/// # fn main() -> Result<(), observable_property::PropertyError> {
+/// // Create source properties
+/// let width = Arc::new(ObservableProperty::new(10));
+/// let height = Arc::new(ObservableProperty::new(5));
+///
+/// // Create computed property for area
+/// let area = computed(
+///     vec![width.clone(), height.clone()],
+///     |values| values[0] * values[1]
+/// )?;
+///
+/// // Initial computed value
+/// assert_eq!(area.get()?, 50);
+///
+/// // Change width - area updates automatically
+/// width.set(20)?;
+/// std::thread::sleep(std::time::Duration::from_millis(10));
+/// assert_eq!(area.get()?, 100);
+///
+/// // Change height - area updates automatically
+/// height.set(8)?;
+/// std::thread::sleep(std::time::Duration::from_millis(10));
+/// assert_eq!(area.get()?, 160);
+/// # Ok(())
+/// # }
+/// ```
+///
+/// ## String Concatenation
+///
+/// ```rust
+/// use observable_property::{ObservableProperty, computed};
+/// use std::sync::Arc;
+///
+/// # fn main() -> Result<(), observable_property::PropertyError> {
+/// let first_name = Arc::new(ObservableProperty::new("John".to_string()));
+/// let last_name = Arc::new(ObservableProperty::new("Doe".to_string()));
+///
+/// let full_name = computed(
+///     vec![first_name.clone(), last_name.clone()],
+///     |values| format!("{} {}", values[0], values[1])
+/// )?;
+///
+/// assert_eq!(full_name.get()?, "John Doe");
+///
+/// first_name.set("Jane".to_string())?;
+/// std::thread::sleep(std::time::Duration::from_millis(10));
+/// assert_eq!(full_name.get()?, "Jane Doe");
+/// # Ok(())
+/// # }
+/// ```
+///
+/// ## Total Price with Tax
+///
+/// ```rust
+/// use observable_property::{ObservableProperty, computed};
+/// use std::sync::Arc;
+///
+/// # fn main() -> Result<(), observable_property::PropertyError> {
+/// let subtotal = Arc::new(ObservableProperty::new(100.0_f64));
+/// let tax_rate = Arc::new(ObservableProperty::new(0.08_f64)); // 8% tax
+///
+/// let total = computed(
+///     vec![subtotal.clone(), tax_rate.clone()],
+///     |values| values[0] * (1.0 + values[1])
+/// )?;
+///
+/// assert_eq!(total.get()?, 108.0);
+///
+/// subtotal.set(200.0)?;
+/// std::thread::sleep(std::time::Duration::from_millis(10));
+/// assert_eq!(total.get()?, 216.0);
+///
+/// tax_rate.set(0.10)?; // Change to 10%
+/// std::thread::sleep(std::time::Duration::from_millis(10));
+/// // Use approximate comparison due to floating point precision
+/// let result = total.get()?;
+/// assert!((result - 220.0).abs() < 0.0001);
+/// # Ok(())
+/// # }
+/// ```
+///
+/// ## Observing Computed Properties
+///
+/// Computed properties are themselves `ObservableProperty` instances, so you can subscribe to them:
+///
+/// ```rust
+/// use observable_property::{ObservableProperty, computed};
+/// use std::sync::Arc;
+///
+/// # fn main() -> Result<(), observable_property::PropertyError> {
+/// let a = Arc::new(ObservableProperty::new(5));
+/// let b = Arc::new(ObservableProperty::new(10));
+///
+/// let sum = computed(
+///     vec![a.clone(), b.clone()],
+///     |values| values[0] + values[1]
+/// )?;
+///
+/// // Subscribe to changes in the computed property
+/// sum.subscribe(Arc::new(|old, new| {
+///     println!("Sum changed from {} to {}", old, new);
+/// }))?;
+///
+/// a.set(7)?; // Will print: "Sum changed from 15 to 17"
+/// std::thread::sleep(std::time::Duration::from_millis(10));
+/// # Ok(())
+/// # }
+/// ```
+///
+/// ## Chaining Computed Properties
+///
+/// You can create computed properties that depend on other computed properties:
+///
+/// ```rust
+/// use observable_property::{ObservableProperty, computed};
+/// use std::sync::Arc;
+///
+/// # fn main() -> Result<(), observable_property::PropertyError> {
+/// let celsius = Arc::new(ObservableProperty::new(0.0));
+///
+/// // First computed property: Celsius to Fahrenheit
+/// let fahrenheit = computed(
+///     vec![celsius.clone()],
+///     |values| values[0] * 9.0 / 5.0 + 32.0
+/// )?;
+///
+/// // Second computed property: Fahrenheit to Kelvin
+/// let kelvin = computed(
+///     vec![fahrenheit.clone()],
+///     |values| (values[0] - 32.0) * 5.0 / 9.0 + 273.15
+/// )?;
+///
+/// assert_eq!(celsius.get()?, 0.0);
+/// assert_eq!(fahrenheit.get()?, 32.0);
+/// assert_eq!(kelvin.get()?, 273.15);
+///
+/// celsius.set(100.0)?;
+/// std::thread::sleep(std::time::Duration::from_millis(10));
+/// assert_eq!(fahrenheit.get()?, 212.0);
+/// assert_eq!(kelvin.get()?, 373.15);
+/// # Ok(())
+/// # }
+/// ```
+///
+/// # Thread Safety
+///
+/// Computed properties are fully thread-safe. Updates happen asynchronously in response to
+/// dependency changes, and proper synchronization ensures the computed value is always
+/// based on the current dependency values at the time of computation.
+///
+/// # Performance Considerations
+///
+/// - The compute function is called every time any dependency changes
+/// - For expensive computations, consider using `subscribe_debounced` or `subscribe_throttled`
+///   on the dependencies before computing
+/// - The computed property uses async notifications, so there may be a small delay between
+///   a dependency change and the computed value update
+pub fn computed<T, U, F>(
+    dependencies: Vec<Arc<ObservableProperty<T>>>,
+    compute_fn: F,
+) -> Result<Arc<ObservableProperty<U>>, PropertyError>
+where
+    T: Clone + Send + Sync + 'static,
+    U: Clone + Send + Sync + 'static,
+    F: Fn(&[T]) -> U + Send + Sync + 'static,
+{
+    // Collect initial values from all dependencies
+    let initial_values: Result<Vec<T>, PropertyError> = 
+        dependencies.iter().map(|dep| dep.get()).collect();
+    let initial_values = initial_values?;
+    
+    // Compute initial value
+    let initial_computed = compute_fn(&initial_values);
+    
+    // Create the computed property
+    let computed_property = Arc::new(ObservableProperty::new(initial_computed));
+    
+    // Wrap compute_fn in Arc for sharing across multiple subscriptions
+    let compute_fn = Arc::new(compute_fn);
+    
+    // Subscribe to each dependency
+    for dependency in dependencies.iter() {
+        let deps_clone = dependencies.clone();
+        let computed_clone = computed_property.clone();
+        let compute_fn_clone = compute_fn.clone();
+        
+        // Subscribe to this dependency
+        dependency.subscribe(Arc::new(move |_old, _new| {
+            // When any dependency changes, collect all current values
+            let current_values: Result<Vec<T>, PropertyError> = 
+                deps_clone.iter().map(|dep| dep.get()).collect();
+            
+            if let Ok(values) = current_values {
+                // Recompute the value
+                let new_computed = compute_fn_clone(&values);
+                
+                // Update the computed property
+                if let Err(e) = computed_clone.set(new_computed) {
+                    eprintln!("Error updating computed property: {}", e);
+                }
+            }
+        }))?;
+    }
+    
+    Ok(computed_property)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4829,6 +5073,181 @@ mod tests {
         // Throttled should have multiple values
         assert!(throttle_vals.len() >= 2, 
             "Throttled should have at least 2 values, got {}", throttle_vals.len());
+    }
+
+    // ========================================================================
+    // Computed Properties Tests
+    // ========================================================================
+
+    #[test]
+    fn test_computed_basic() {
+        let a = Arc::new(ObservableProperty::new(5));
+        let b = Arc::new(ObservableProperty::new(10));
+
+        let sum = computed(
+            vec![a.clone(), b.clone()],
+            |values| values[0] + values[1]
+        ).expect("Failed to create computed property");
+
+        assert_eq!(sum.get().unwrap(), 15);
+
+        a.set(7).expect("Failed to set a");
+        thread::sleep(Duration::from_millis(10));
+        assert_eq!(sum.get().unwrap(), 17);
+
+        b.set(3).expect("Failed to set b");
+        thread::sleep(Duration::from_millis(10));
+        assert_eq!(sum.get().unwrap(), 10);
+    }
+
+    #[test]
+    fn test_computed_with_observer() {
+        let width = Arc::new(ObservableProperty::new(10));
+        let height = Arc::new(ObservableProperty::new(5));
+
+        let area = computed(
+            vec![width.clone(), height.clone()],
+            |values| values[0] * values[1]
+        ).expect("Failed to create computed property");
+
+        let notification_count = Arc::new(AtomicUsize::new(0));
+        let count_clone = notification_count.clone();
+
+        area.subscribe(Arc::new(move |_old, _new| {
+            count_clone.fetch_add(1, Ordering::SeqCst);
+        })).expect("Failed to subscribe");
+
+        assert_eq!(area.get().unwrap(), 50);
+
+        width.set(20).expect("Failed to set width");
+        thread::sleep(Duration::from_millis(10));
+        assert_eq!(area.get().unwrap(), 100);
+        assert_eq!(notification_count.load(Ordering::SeqCst), 1);
+
+        height.set(8).expect("Failed to set height");
+        thread::sleep(Duration::from_millis(10));
+        assert_eq!(area.get().unwrap(), 160);
+        assert_eq!(notification_count.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn test_computed_string_concatenation() {
+        let first = Arc::new(ObservableProperty::new("Hello".to_string()));
+        let last = Arc::new(ObservableProperty::new("World".to_string()));
+
+        let full = computed(
+            vec![first.clone(), last.clone()],
+            |values| format!("{} {}", values[0], values[1])
+        ).expect("Failed to create computed property");
+
+        assert_eq!(full.get().unwrap(), "Hello World");
+
+        first.set("Goodbye".to_string()).expect("Failed to set first");
+        thread::sleep(Duration::from_millis(10));
+        assert_eq!(full.get().unwrap(), "Goodbye World");
+
+        last.set("Rust".to_string()).expect("Failed to set last");
+        thread::sleep(Duration::from_millis(10));
+        assert_eq!(full.get().unwrap(), "Goodbye Rust");
+    }
+
+    #[test]
+    fn test_computed_chaining() {
+        let celsius = Arc::new(ObservableProperty::new(0.0));
+
+        let fahrenheit = computed(
+            vec![celsius.clone()],
+            |values| values[0] * 9.0 / 5.0 + 32.0
+        ).expect("Failed to create fahrenheit");
+
+        let kelvin = computed(
+            vec![celsius.clone()],
+            |values| values[0] + 273.15
+        ).expect("Failed to create kelvin");
+
+        assert_eq!(celsius.get().unwrap(), 0.0);
+        assert_eq!(fahrenheit.get().unwrap(), 32.0);
+        assert_eq!(kelvin.get().unwrap(), 273.15);
+
+        celsius.set(100.0).expect("Failed to set celsius");
+        thread::sleep(Duration::from_millis(10));
+        assert_eq!(fahrenheit.get().unwrap(), 212.0);
+        assert_eq!(kelvin.get().unwrap(), 373.15);
+    }
+
+    #[test]
+    fn test_computed_multiple_dependencies() {
+        let a = Arc::new(ObservableProperty::new(1));
+        let b = Arc::new(ObservableProperty::new(2));
+        let c = Arc::new(ObservableProperty::new(3));
+
+        let result = computed(
+            vec![a.clone(), b.clone(), c.clone()],
+            |values| values[0] + values[1] * values[2]
+        ).expect("Failed to create computed property");
+
+        // Initial: 1 + 2 * 3 = 7
+        assert_eq!(result.get().unwrap(), 7);
+
+        a.set(5).expect("Failed to set a");
+        thread::sleep(Duration::from_millis(10));
+        // 5 + 2 * 3 = 11
+        assert_eq!(result.get().unwrap(), 11);
+
+        b.set(4).expect("Failed to set b");
+        thread::sleep(Duration::from_millis(10));
+        // 5 + 4 * 3 = 17
+        assert_eq!(result.get().unwrap(), 17);
+
+        c.set(2).expect("Failed to set c");
+        thread::sleep(Duration::from_millis(10));
+        // 5 + 4 * 2 = 13
+        assert_eq!(result.get().unwrap(), 13);
+    }
+
+    #[test]
+    fn test_computed_single_dependency() {
+        let number = Arc::new(ObservableProperty::new(5));
+
+        let doubled = computed(
+            vec![number.clone()],
+            |values| values[0] * 2
+        ).expect("Failed to create computed property");
+
+        assert_eq!(doubled.get().unwrap(), 10);
+
+        number.set(7).expect("Failed to set number");
+        thread::sleep(Duration::from_millis(10));
+        assert_eq!(doubled.get().unwrap(), 14);
+    }
+
+    #[test]
+    fn test_computed_complex_calculation() {
+        let base = Arc::new(ObservableProperty::new(10.0_f64));
+        let rate = Arc::new(ObservableProperty::new(0.05_f64));
+        let years = Arc::new(ObservableProperty::new(2.0_f64));
+
+        // Compound interest formula: A = P(1 + r)^t
+        let amount = computed(
+            vec![base.clone(), rate.clone(), years.clone()],
+            |values| values[0] * (1.0 + values[1]).powf(values[2])
+        ).expect("Failed to create computed property");
+
+        // 10 * (1.05)^2 ≈ 11.025
+        let initial_amount = amount.get().unwrap();
+        assert!((initial_amount - 11.025_f64).abs() < 0.001);
+
+        base.set(100.0_f64).expect("Failed to set base");
+        thread::sleep(Duration::from_millis(10));
+        // 100 * (1.05)^2 ≈ 110.25
+        let new_amount = amount.get().unwrap();
+        assert!((new_amount - 110.25_f64).abs() < 0.001);
+
+        years.set(5.0_f64).expect("Failed to set years");
+        thread::sleep(Duration::from_millis(10));
+        // 100 * (1.05)^5 ≈ 127.628
+        let final_amount = amount.get().unwrap();
+        assert!((final_amount - 127.628_f64).abs() < 0.001);
     }
 }
 
