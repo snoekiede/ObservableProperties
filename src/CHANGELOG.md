@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.4.4] - Unreleased
+## [0.4.4] - 2026-10-08
 
 ### Added
 - All-features test run to CI.
@@ -24,7 +24,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Record undo and modify transitions in event logs, change counts, and notification metrics while preserving undo-history semantics.
 - Restore the previous value if a `modify()` closure, validator, or equality function panics before resuming the panic.
 
-## [0.4.2] - 2024-01-XX
+## [0.4.2] - 2024-01-25
 
 ### Added
 - Exhaustive test suite with 235 tests (128 unit + 107 doc tests)
