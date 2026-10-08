@@ -2,7 +2,6 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
 use crate::observer::{ObserverId, ObserverRef};
 use crate::events::PropertyEvent;
 #[cfg(feature = "debug")]
@@ -21,7 +20,9 @@ where
     // Metrics tracking
     pub(crate) total_changes: usize,
     pub(crate) observer_calls: usize,
-    pub(crate) notification_times: Vec<Duration>,
+    pub(crate) notification_time_nanos: u128,
+    pub(crate) notification_count: u128,
+    pub(crate) active_async_workers: usize,
     // Debug tracking
     #[cfg(feature = "debug")]
     pub(crate) debug_logging_enabled: bool,

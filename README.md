@@ -9,16 +9,15 @@
 * **Computed properties**: Automatically recompute derived values when dependencies change
 * **Debouncing**: Delay notifications until changes stop for a specified duration
 * **Throttling**: Rate-limit notifications to at most once per time interval
-* **Async notifications**: Non-blocking observer notifications with background threads
-* **Configurable threading**: Customize thread pool size for async notifications via `with_max_threads()`
+* **Async notifications**: Bounded background workers with caller-thread fallback under load
+* **Configurable threading**: Set the per-property background worker limit via `with_max_threads()`
 * **Panic isolation**: Observer panics don't crash the system
 * **Robust error handling**: Comprehensive error handling with descriptive error messages
-* **Production-ready**: No `unwrap()` calls - all errors are handled gracefully
 * **Type-safe**: Generic implementation works with any `Clone + Send + Sync + 'static' type
-* **Zero dependencies**: Uses only Rust standard library
-* **Exhaustively tested**: 235 tests (128 unit + 107 doc tests) with 100% feature coverage
+* **No mandatory runtime dependencies**: Optional serde and debug features add their own dependencies
+* **Tested with all features**: 246 unit and documentation tests
 
-A thread-safe observable property implementation for Rust that allows you to observe changes to values across multiple threads. Built with comprehensive error handling and no `unwrap()` calls for maximum reliability.
+A thread-safe observable property implementation for Rust that allows you to observe changes to values across multiple threads.
 
 ### Contact me
 If you find bugs, please mail me at snoekiede@gmail.com and mention the name of the crate in the subject.
@@ -28,7 +27,7 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-observable-property = "0.4.2"
+observable-property = "0.4.3"
 ```
 
 ## Usage
@@ -331,7 +330,7 @@ fn main() -> Result<(), observable_property::PropertyError> {
 
 ### Async Notifications
 
-For observers that might perform time-consuming operations, use async notifications to avoid blocking:
+`set_async()` normally runs observers on background workers. The worker limit is shared across concurrent calls and clones of one property. When all slots are occupied, or the operating system cannot start a worker, that call runs its observers on the calling thread instead. This preserves notifications while bounding library-created background workers; it means `set_async()` can block under load.
 
 ```rust
 use observable_property::ObservableProperty;
@@ -342,7 +341,7 @@ fn main() -> Result<(), observable_property::PropertyError> {
     let property = ObservableProperty::new(0);
 
     let _subscription = property.subscribe_with_subscription(Arc::new(|old, new| {
-        // This slow observer won't block the caller
+        // Usually runs on a background worker; it can run inline under load
         std::thread::sleep(Duration::from_millis(100));
         println!("Slow observer: {} -> {}", old, new);
     })).map_err(|e| {
@@ -350,13 +349,13 @@ fn main() -> Result<(), observable_property::PropertyError> {
         e
     })?;
 
-    // This returns immediately even though observer is slow
+    // Normally returns without waiting for the observer
     property.set_async(42).map_err(|e| {
         eprintln!("Failed to set value asynchronously: {}", e);
         e
     })?;
     
-    // Continue with other work while observers run in background
+    // Continue while the observer runs in the background (when capacity is available)
     println!("This prints immediately!");
     
     Ok(())
@@ -365,7 +364,7 @@ fn main() -> Result<(), observable_property::PropertyError> {
 
 ### Configurable Threading
 
-Customize the thread pool size for async notifications based on your system requirements:
+Set the maximum number of concurrent background notification workers per property:
 
 ```rust
 use observable_property::ObservableProperty;
@@ -386,7 +385,7 @@ fn main() -> Result<(), observable_property::PropertyError> {
         println!("High performance: {} -> {}", old, new);
     }))?;
 
-    // Async notifications will use the configured thread pool
+    // At most eight background workers are active for this property
     high_perf_property.set_async(100)?;
     
     Ok(())
@@ -395,7 +394,7 @@ fn main() -> Result<(), observable_property::PropertyError> {
 
 ## Error Handling
 
-The library uses a comprehensive error system for robust, production-ready error handling. **All operations are designed to fail gracefully** with meaningful error messages - there are no `unwrap()` calls that can cause unexpected panics.
+Operations that can fail return `PropertyError` values for conditions such as validation or subscription-limit failures. Observer panics are isolated. User-provided callbacks may still panic; `modify()` rolls back its value before resuming a panic from its closure, validator, or equality function.
 
 ### Error Types
 
@@ -416,12 +415,6 @@ fn example() -> Result<(), PropertyError> {
             property.set(100)?;
             property.unsubscribe(observer_id)?;
         }
-        Err(PropertyError::PoisonedLock) => {
-            eprintln!("Property lock was poisoned by a panic in another thread");
-        }
-        Err(PropertyError::WriteLockError { context }) => {
-            eprintln!("Failed to acquire write lock: {}", context);
-        }
         Err(e) => {
             eprintln!("Other error: {}", e);
         }
@@ -435,22 +428,14 @@ fn example() -> Result<(), PropertyError> {
 
 The library is designed to handle edge cases gracefully:
 
-- **Poisoned locks**: When a thread panics while holding a lock, the property becomes "poisoned." All subsequent operations return clear error messages instead of panicking
+- **Poisoned locks**: Operations recover access to the protected state after lock poisoning. This does not roll back arbitrary changes made before a panic.
 - **Observer panics**: If an observer function panics, it's isolated - other observers continue to work normally
 - **Thread safety**: All error conditions are thread-safe and don't cause data races or undefined behavior
 - **Resource cleanup**: RAII subscriptions clean up properly even when locks are poisoned or other errors occur
 
 ```rust
-// Even if a lock is poisoned, operations fail gracefully
-match property.subscribe_with_subscription(observer) {
-    Ok(_subscription) => println!("Successfully subscribed"),
-    Err(PropertyError::PoisonedLock) => {
-        // Handle gracefully - no panics, clear error message
-        eprintln!("Property is in an invalid state due to a previous panic");
-        // Can still safely continue program execution
-    }
-    Err(e) => eprintln!("Other error: {}", e),
-}
+// Lock poisoning is recovered internally; handle returned errors such as validation
+// failures and observer-limit exhaustion at the operation where they can occur.
 ```
 
 ## Subscription Management
@@ -479,7 +464,7 @@ let _subscription = property.subscribe_with_subscription(observer)?;
 
 ## Performance Considerations
 
-- **Observers**: Each observer is called sequentially. For heavy computations, use `set_async()` to run observers in background threads.
+- **Observers**: `set()` invokes observers sequentially after releasing the property lock. `set_async()` uses bounded background workers, but may invoke observers inline when saturated.
 - **Lock contention**: The property uses a single `RwLock` internally. Consider having fewer, larger properties rather than many small ones.
 - **Memory**: Observer functions are stored as `Arc<dyn Fn>` and kept until unsubscribed or subscription is dropped.
 - **RAII overhead**: Subscription objects have minimal overhead (just an ID and Arc reference).
@@ -489,12 +474,11 @@ let _subscription = property.subscribe_with_subscription(observer)?;
 All operations are thread-safe with comprehensive error handling:
 - Multiple threads can read the property value simultaneously
 - Only one thread can modify the property at a time
-- Observer notifications happen outside the lock to minimize contention
+- Observer callbacks run outside the property lock to minimize contention
 - Observer panics are isolated and don't affect other observers or the property
 - RAII subscriptions can be created and dropped from any thread
-- **Poisoned locks are handled gracefully** - subscriptions clean up without panicking
-- **No `unwrap()` calls** - all potential failure points use proper error handling
-- **Fail-safe design** - errors never cause undefined behavior or crashes
+- Poisoned locks are recovered internally; recovery does not imply rollback of arbitrary state changes
+- User-provided validators, equality functions, and `modify()` closures must not re-enter the same property while its write lock is held
 
 ## Best Practices
 
@@ -543,17 +527,16 @@ let _subscription = property.subscribe_with_subscription(Arc::new(|_, new| {
     expensive_computation(*new);
 }))?;
 
-// ✅ Better: Use async for heavy work
-property.set_async(new_value)?; // Non-blocking
+// ✅ Better: Use async dispatch for heavy work, remembering saturated calls may run inline
+property.set_async(new_value)?;
 ```
 
 ### Comprehensive Error Handling
-The library is production-ready with robust error handling. Always handle potential errors:
+Handle returned errors at the operation that can produce them:
 
 **Key benefits:**
-- ✅ No `unwrap()` calls that could panic unexpectedly
 - ✅ Clear, descriptive error messages for debugging
-- ✅ Graceful degradation in all error conditions
+- ✅ Observer panics are isolated
 - ✅ Thread-safe error handling
 
 ```rust
@@ -593,6 +576,13 @@ let _subscription = property.subscribe_with_subscription(Arc::new(|old, new| {
 
 ## Recent Improvements
 
+### v0.4.3 - Bounded Async Dispatch and Panic Safety
+
+- **Bounded async workers**: `set_async()` shares a per-property worker limit across clones and concurrent calls; saturated dispatch falls back inline.
+- **Constant-space metrics**: Notification timing averages no longer retain a sample for every update.
+- **Panic-safe modification**: `modify()` restores the previous value before resuming a panic from user code.
+- **All-features CI**: Optional serde documentation examples are exercised by the test workflow.
+
 ### v0.4.1 - Debouncing & Throttling
 
 - ⏱️ **Debouncing support**: New `subscribe_debounced()` delays notifications until changes stop
@@ -630,20 +620,20 @@ let _subscription = property.subscribe_with_subscription(Arc::new(|old, new| {
 - 🚀 **Performance**: No runtime performance impact from improved error handling
 - 📚 **Better debugging**: Clear error context helps identify issues quickly
 
-The library now provides both robust error handling and configurable performance tuning, making it suitable for a wide range of production environments from embedded systems to high-throughput servers.
+Async callbacks can execute inline when background capacity is saturated, and callback ordering is not guaranteed across concurrent setters. Keep observers safe for concurrent invocation and use synchronous updates when ordering or completion is required.
 
 ## Testing
 
-This library has **exhaustive test coverage** with 235 total tests ensuring reliability and correctness:
+Run the full feature matrix with `cargo test --all-features`. The current suite contains 246 tests:
 
 ### Test Statistics
-- **128 unit tests** - Comprehensive testing of all functionality
-- **107 documentation tests** - Every public API example is tested
+- **132 unit tests**
+- **114 documentation tests**
 - **100% passing** - All tests consistently pass
 
 ### Coverage Areas
 
-#### Core Features (100% Covered)
+#### Core Features
 - ✅ Property creation and basic operations
 - ✅ Observer subscription and notification
 - ✅ RAII subscription automatic cleanup
@@ -651,7 +641,7 @@ This library has **exhaustive test coverage** with 235 total tests ensuring reli
 - ✅ Error handling and graceful degradation
 - ✅ Async notifications with background threads
 
-#### Advanced Features (100% Covered)
+#### Advanced Features
 - ✅ **Validation** (`with_validator`) - Valid/invalid values, error handling
 - ✅ **Custom Equality** (`with_equality`) - Epsilon tolerance, case-insensitive strings
 - ✅ **History Tracking** (`with_history`) - Undo/redo, bounded buffers

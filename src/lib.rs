@@ -349,6 +349,20 @@ where
     max_observers: usize,
 }
 
+struct AsyncWorkerGuard<T: Clone + Send + Sync + 'static> {
+    inner: Arc<RwLock<InnerProperty<T>>>,
+}
+
+impl<T: Clone + Send + Sync + 'static> Drop for AsyncWorkerGuard<T> {
+    fn drop(&mut self) {
+        let mut prop = match self.inner.write() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        prop.active_async_workers = prop.active_async_workers.saturating_sub(1);
+    }
+}
+
 impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
     /// Creates a new observable property with the given initial value
     ///
@@ -377,7 +391,9 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
                 history_size: 0,
                 total_changes: 0,
                 observer_calls: 0,
-                notification_times: Vec::new(),
+                notification_time_nanos: 0,
+                notification_count: 0,
+                active_async_workers: 0,
                 #[cfg(feature = "debug")]
                 debug_logging_enabled: false,
                 #[cfg(feature = "debug")]
@@ -501,7 +517,9 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
     /// # Thread Safety
     ///
     /// The equality function must be `Send + Sync + 'static` as it may be called from
-    /// any thread that modifies the property.
+    /// any thread that modifies the property. It runs while the property's write lock
+    /// is held to keep the comparison atomic; do not call methods on the same property
+    /// from this function, as that can deadlock.
     pub fn with_equality<F>(initial_value: T, eq_fn: F) -> Self
     where
         F: Fn(&T, &T) -> bool + Send + Sync + 'static,
@@ -515,7 +533,9 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
                 history_size: 0,
                 total_changes: 0,
                 observer_calls: 0,
-                notification_times: Vec::new(),
+                notification_time_nanos: 0,
+                notification_count: 0,
+                active_async_workers: 0,
                 #[cfg(feature = "debug")]
                 debug_logging_enabled: false,
                 #[cfg(feature = "debug")]
@@ -743,7 +763,9 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
                 history_size: 0,
                 total_changes: 0,
                 observer_calls: 0,
-                notification_times: Vec::new(),
+                notification_time_nanos: 0,
+                notification_count: 0,
+                active_async_workers: 0,
                 #[cfg(feature = "debug")]
                 debug_logging_enabled: false,
                 #[cfg(feature = "debug")]
@@ -772,10 +794,11 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
     /// * `max_threads` - Maximum number of threads to use for async notifications.
     ///   If 0 is provided, defaults to 4.
     ///
-    /// # Thread Pool Behavior
+    /// # Background Worker Limit
     ///
-    /// When `set_async()` is called, observers are divided into batches and each batch
-    /// runs in its own thread, up to the specified maximum. For example:
+    /// Across concurrent calls and clones of the same property, no more than
+    /// `max_threads` notification workers run in background threads. When all worker
+    /// slots are busy, notifications run on the calling thread instead. For example:
     /// - With 100 observers and `max_threads = 4`: 4 threads with ~25 observers each
     /// - With 10 observers and `max_threads = 8`: 10 threads with 1 observer each
     /// - With 2 observers and `max_threads = 4`: 2 threads with 1 observer each
@@ -808,8 +831,8 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
     ///
     /// # Performance Considerations
     ///
-    /// - **Higher values**: Better parallelism but more thread overhead and memory usage
-    /// - **Lower values**: Less overhead but potentially slower async notifications
+    /// - **Higher values**: More background parallelism and thread overhead
+    /// - **Lower values**: Less background parallelism; saturated calls may run inline
     /// - **Optimal range**: Typically between 1 and 2x the number of CPU cores
     /// - **Zero value**: Automatically uses the default value (4)
     ///
@@ -850,7 +873,9 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
                 history_size: 0,
                 total_changes: 0,
                 observer_calls: 0,
-                notification_times: Vec::new(),
+                notification_time_nanos: 0,
+                notification_count: 0,
+                active_async_workers: 0,
                 #[cfg(feature = "debug")]
                 debug_logging_enabled: false,
                 #[cfg(feature = "debug")]
@@ -1172,7 +1197,9 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
                 history_size,
                 total_changes: 0,
                 observer_calls: 0,
-                notification_times: Vec::new(),
+                notification_time_nanos: 0,
+                notification_count: 0,
+                active_async_workers: 0,
                 #[cfg(feature = "debug")]
                 debug_logging_enabled: false,
                 #[cfg(feature = "debug")]
@@ -1408,7 +1435,9 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
                 history_size: 0,
                 total_changes: 0,
                 observer_calls: 0,
-                notification_times: Vec::new(),
+                notification_time_nanos: 0,
+                notification_count: 0,
+                active_async_workers: 0,
                 #[cfg(feature = "debug")]
                 debug_logging_enabled: false,
                 #[cfg(feature = "debug")]
@@ -2037,12 +2066,16 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
     pub fn get_metrics(&self) -> Result<PropertyMetrics, PropertyError> {
         match self.inner.read() {
             Ok(prop) => {
-                let avg_notification_time = if prop.notification_times.is_empty() {
-                    Duration::from_secs(0)
-                } else {
-                    let total: Duration = prop.notification_times.iter().sum();
-                    total / prop.notification_times.len() as u32
-                };
+                let avg_notification_time = prop
+                    .notification_time_nanos
+                    .checked_div(prop.notification_count)
+                    .map(|nanos| {
+                        Duration::new(
+                            (nanos / 1_000_000_000) as u64,
+                            (nanos % 1_000_000_000) as u32,
+                        )
+                    })
+                    .unwrap_or_else(|| Duration::from_secs(0));
 
                 Ok(PropertyMetrics {
                     total_changes: prop.total_changes,
@@ -2053,12 +2086,16 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
             Err(poisoned) => {
                 // Graceful degradation: recover metrics from poisoned lock
                 let prop = poisoned.into_inner();
-                let avg_notification_time = if prop.notification_times.is_empty() {
-                    Duration::from_secs(0)
-                } else {
-                    let total: Duration = prop.notification_times.iter().sum();
-                    total / prop.notification_times.len() as u32
-                };
+                let avg_notification_time = prop
+                    .notification_time_nanos
+                    .checked_div(prop.notification_count)
+                    .map(|nanos| {
+                        Duration::new(
+                            (nanos / 1_000_000_000) as u64,
+                            (nanos % 1_000_000_000) as u32,
+                        )
+                    })
+                    .unwrap_or_else(|| Duration::from_secs(0));
 
                 Ok(PropertyMetrics {
                     total_changes: prop.total_changes,
@@ -2111,15 +2148,16 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
     /// ```
     pub fn set(&self, new_value: T) -> Result<(), PropertyError> {
         // Validate the new value if a validator is configured
-        {
+        let validator = {
             let prop = match self.inner.read() {
                 Ok(guard) => guard,
                 Err(poisoned) => poisoned.into_inner(),
             };
-            
-            if let Some(validator) = &prop.validator {
-                validator(&new_value).map_err(|reason| PropertyError::ValidationError { reason })?;
-            }
+            prop.validator.clone()
+        };
+
+        if let Some(validator) = validator {
+            validator(&new_value).map_err(|reason| PropertyError::ValidationError { reason })?;
         }
 
         let notification_start = Instant::now();
@@ -2228,7 +2266,10 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
                 Err(poisoned) => poisoned.into_inner(),
             };
             prop.observer_calls += observer_count;
-            prop.notification_times.push(notification_time);
+            prop.notification_time_nanos = prop
+                .notification_time_nanos
+                .saturating_add(notification_time.as_nanos());
+            prop.notification_count = prop.notification_count.saturating_add(1);
         }
 
         // Clean up dead weak observers
@@ -2247,12 +2288,12 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
 
     /// Sets the property to a new value and notifies observers asynchronously
     ///
-    /// This method is similar to `set()` but spawns observers in background threads
-    /// for non-blocking operation. This is useful when observers might perform
-    /// time-consuming operations.
+    /// This method is similar to `set()` but normally runs observers in background
+    /// threads. This is useful when observers might perform time-consuming operations.
     ///
     /// Observers are batched into groups and each batch runs in its own thread
-    /// to limit resource usage while still providing parallelism.
+    /// to limit resource usage while still providing parallelism. The worker limit is
+    /// shared across concurrent calls and clones of this property.
     ///
     /// # Thread Management (Fire-and-Forget Pattern)
     ///
@@ -2261,20 +2302,22 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
     /// for non-blocking behavior but has important implications:
     ///
     /// ## Characteristics:
-    /// - ✅ **Non-blocking**: Returns immediately without waiting for observers
-    /// - ✅ **High performance**: No synchronization overhead
-    /// - ⚠️ **No completion guarantee**: Thread may still be running when method returns
+    /// - **Bounded workers**: At most `max_threads` notification workers run in the background
+    /// - **Saturation fallback**: If all workers are busy, observers run on the caller's thread
+    /// - **Spawn failure fallback**: If the OS cannot create a worker, its observers run inline
+    /// - **No completion guarantee**: Background observers may still be running when this returns
     /// - ⚠️ **No error propagation**: Observer errors are logged but not returned
     /// - ⚠️ **Testing caveat**: May need explicit delays to observe side effects
     /// - ⚠️ **Ordering caveat**: Multiple rapid `set_async()` calls may result in observers
     ///   receiving notifications out of order due to thread scheduling. Use `set()` if
-    ///   sequential ordering is critical.
+    ///   sequential ordering is critical. Concurrent calls to `set()` can also notify
+    ///   observers out of update order.
     ///
     /// ## Use Cases:
     /// - **UI updates**: Fire updates without blocking the main thread
     /// - **Logging**: Asynchronous logging that doesn't block operations
-    /// - **Metrics**: Non-critical telemetry that can be lost
-    /// - **Notifications**: Fire-and-forget alerts or messages
+    /// - **Metrics**: Non-critical telemetry
+    /// - **Notifications**: Alerts or messages where callbacks may run inline under load
     ///
     /// ## When NOT to Use:
     /// - **Critical operations**: Use `set()` if you need guarantees
@@ -2314,9 +2357,9 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
     ///
     /// # Returns
     ///
-    /// `Ok(())` if successful, or `Err(PropertyError)` if the lock is poisoned.
-    /// Note that this only indicates the property was updated successfully;
-    /// observer execution happens asynchronously and errors are not returned.
+    /// `Ok(())` if the value was updated, or `Err(PropertyError)` if validation fails.
+    /// Observer panics are isolated. Notifications may execute inline when background
+    /// capacity is saturated or thread creation fails.
     ///
     /// # Examples
     ///
@@ -2376,19 +2419,20 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
     /// ```
     pub fn set_async(&self, new_value: T) -> Result<(), PropertyError> {
         // Validate the new value if a validator is configured
-        {
+        let validator = {
             let prop = match self.inner.read() {
                 Ok(guard) => guard,
                 Err(poisoned) => poisoned.into_inner(),
             };
-            
-            if let Some(validator) = &prop.validator {
-                validator(&new_value).map_err(|reason| PropertyError::ValidationError { reason })?;
-            }
+            prop.validator.clone()
+        };
+
+        if let Some(validator) = validator {
+            validator(&new_value).map_err(|reason| PropertyError::ValidationError { reason })?;
         }
 
         let notification_start = Instant::now();
-        let (old_value, observers_snapshot, dead_observer_ids, in_batch) = {
+        let (old_value, observers_snapshot, dead_observer_ids, in_batch, run_async) = {
             let mut prop = match self.inner.write() {
                 Ok(guard) => guard,
                 Err(poisoned) => {
@@ -2411,6 +2455,32 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
 
             // Check if we're in a batch update
             let in_batch = prop.batch_depth > 0;
+
+            let mut observers_snapshot = Vec::new();
+            let mut dead_ids = Vec::new();
+            if !in_batch {
+                for (id, observer_ref) in &prop.observers {
+                    if let Some(observer) = observer_ref.try_call() {
+                        observers_snapshot.push(observer);
+                    } else {
+                        dead_ids.push(*id);
+                    }
+                }
+            }
+
+            let max_workers = observers_snapshot.len().min(self.max_threads);
+            let observers_per_thread = if max_workers == 0 {
+                0
+            } else {
+                observers_snapshot.len().div_ceil(max_workers)
+            };
+            let worker_count = if observers_per_thread == 0 {
+                0
+            } else {
+                observers_snapshot.len().div_ceil(observers_per_thread)
+            };
+            let run_async = worker_count > 0
+                && prop.active_async_workers.saturating_add(worker_count) <= self.max_threads;
 
             // Performance optimization: use mem::replace to avoid one clone operation
             let old_value = mem::replace(&mut prop.value, new_value.clone());
@@ -2452,21 +2522,11 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
                 }
             }
             
-            // Collect active observers and track dead weak observers (only if not in batch)
-            let mut observers_snapshot = Vec::new();
-            let mut dead_ids = Vec::new();
-            if !in_batch {
-                for (id, observer_ref) in &prop.observers {
-                    if let Some(observer) = observer_ref.try_call() {
-                        observers_snapshot.push(observer);
-                    } else {
-                        // Weak observer is dead, mark for removal
-                        dead_ids.push(*id);
-                    }
-                }
+            if run_async {
+                prop.active_async_workers += worker_count;
             }
             
-            (old_value, observers_snapshot, dead_ids, in_batch)
+            (old_value, observers_snapshot, dead_ids, in_batch, run_async)
         };
 
         // Skip notifications if we're in a batch update
@@ -2493,27 +2553,47 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
         // Record metrics for async notifications (time to spawn threads, not execute)
         let observer_count = observers_snapshot.len();
         
-        // Fire-and-forget pattern: Spawn threads without joining
-        // This is intentional for non-blocking behavior. Observers run independently
-        // and the caller continues immediately without waiting for completion.
-        // Trade-offs:
-        //   ✅ Non-blocking, high performance
-        //   ⚠️ No completion guarantee, no error propagation to caller
-        for batch in observers_snapshot.chunks(observers_per_thread) {
-            let batch_observers = batch.to_vec();
-            let old_val = old_value.clone();
-            let new_val = new_value.clone();
+        if run_async {
+            for batch in observers_snapshot.chunks(observers_per_thread) {
+                let batch_observers = batch.to_vec();
+                let fallback_observers = batch.to_vec();
+                let old_val = old_value.clone();
+                let new_val = new_value.clone();
+                let fallback_old = old_value.clone();
+                let fallback_new = new_value.clone();
+                let worker_guard = AsyncWorkerGuard {
+                    inner: self.inner.clone(),
+                };
 
-            thread::spawn(move || {
-                for observer in batch_observers {
-                    if let Err(e) = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-                        observer(&old_val, &new_val);
-                    })) {
-                        eprintln!("Observer panic in batch thread: {:?}", e);
+                let spawn_result = thread::Builder::new().spawn(move || {
+                    let _worker_guard = worker_guard;
+                    for observer in batch_observers {
+                        if let Err(e) = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+                            observer(&old_val, &new_val);
+                        })) {
+                            eprintln!("Observer panic in batch thread: {:?}", e);
+                        }
+                    }
+                });
+
+                if spawn_result.is_err() {
+                    for observer in fallback_observers {
+                        if let Err(e) = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+                            observer(&fallback_old, &fallback_new);
+                        })) {
+                            eprintln!("Observer panic: {:?}", e);
+                        }
                     }
                 }
-            });
-            // Thread handle intentionally dropped - fire-and-forget pattern
+            }
+        } else {
+            for observer in observers_snapshot {
+                if let Err(e) = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+                    observer(&old_value, &new_value);
+                })) {
+                    eprintln!("Observer panic: {:?}", e);
+                }
+            }
         }
         
         // Record notification time (time to spawn all threads)
@@ -2524,7 +2604,10 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
                 Err(poisoned) => poisoned.into_inner(),
             };
             prop.observer_calls += observer_count;
-            prop.notification_times.push(notification_time);
+            prop.notification_time_nanos = prop
+                .notification_time_nanos
+                .saturating_add(notification_time.as_nanos());
+            prop.notification_count = prop.notification_count.saturating_add(1);
         }
 
         // Clean up dead weak observers
@@ -2717,7 +2800,10 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
                     Err(poisoned) => poisoned.into_inner(),
                 };
                 prop.observer_calls += observer_count;
-                prop.notification_times.push(notification_time);
+                prop.notification_time_nanos = prop
+                    .notification_time_nanos
+                    .saturating_add(notification_time.as_nanos());
+                prop.notification_count = prop.notification_count.saturating_add(1);
             }
 
             // Clean up dead weak observers
@@ -4027,7 +4113,9 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
                 history_size: 0,
                 total_changes: 0,
                 observer_calls: 0,
-                notification_times: Vec::new(),
+                notification_time_nanos: 0,
+                notification_count: 0,
+                active_async_workers: 0,
                 #[cfg(feature = "debug")]
                 debug_logging_enabled: false,
                 #[cfg(feature = "debug")]
@@ -4109,7 +4197,9 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
     ///
     /// This method allows you to update the property based on its current value
     /// in a single atomic operation. The closure receives a mutable reference to
-    /// the value and can modify it in place.
+    /// the value and can modify it in place. The closure and any configured validator
+    /// or equality function run while the write lock is held; they must not call methods
+    /// on the same property. If the closure panics, its changes are rolled back.
     ///
     /// # Arguments
     ///
@@ -4156,23 +4246,46 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
             };
 
             let old_value = prop.value.clone();
-            f(&mut prop.value);
+            if let Err(payload) = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+                f(&mut prop.value);
+            })) {
+                prop.value = old_value;
+                drop(prop);
+                panic::resume_unwind(payload);
+            }
             let new_value = prop.value.clone();
             
             // Validate the modified value if a validator is configured
-            if let Some(validator) = &prop.validator {
-                validator(&new_value).map_err(|reason| {
-                    // Restore the old value if validation fails
-                    prop.value = old_value.clone();
-                    PropertyError::ValidationError { reason }
-                })?;
+            let validation_result = prop.validator.as_ref().map(|validator| {
+                panic::catch_unwind(panic::AssertUnwindSafe(|| validator(&new_value)))
+            });
+            if let Some(validation_result) = validation_result {
+                match validation_result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(reason)) => {
+                        prop.value = old_value.clone();
+                        return Err(PropertyError::ValidationError { reason });
+                    }
+                    Err(payload) => {
+                        prop.value = old_value;
+                        drop(prop);
+                        panic::resume_unwind(payload);
+                    }
+                }
             }
             
             // Check if values are equal using custom equality function if provided
-            let values_equal = if let Some(eq_fn) = &prop.eq_fn {
-                eq_fn(&old_value, &new_value)
-            } else {
-                false  // No equality function = always notify
+            let equality_result = prop.eq_fn.as_ref().map(|eq_fn| {
+                panic::catch_unwind(panic::AssertUnwindSafe(|| eq_fn(&old_value, &new_value)))
+            });
+            let values_equal = match equality_result {
+                Some(Ok(values_equal)) => values_equal,
+                Some(Err(payload)) => {
+                    prop.value = old_value;
+                    drop(prop);
+                    panic::resume_unwind(payload);
+                }
+                None => false,
             };
 
             // If values are equal, skip everything
@@ -7406,6 +7519,38 @@ mod tests {
     }
 
     #[test]
+    fn test_async_worker_limit_falls_back_inline() {
+        let prop = ObservableProperty::with_max_threads(0, 1);
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        let observer_release_rx = release_rx.clone();
+
+        let _subscription = prop
+            .subscribe_with_subscription(Arc::new(move |_, new| {
+                if *new == 1 {
+                    started_tx.send(()).unwrap();
+                    observer_release_rx.lock().unwrap().recv().unwrap();
+                }
+            }))
+            .unwrap();
+
+        prop.set_async(1).unwrap();
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        prop.set_async(2).unwrap();
+
+        assert_eq!(prop.get().unwrap(), 2);
+        assert_eq!(prop.inner.read().unwrap().active_async_workers, 1);
+
+        release_tx.send(()).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while prop.inner.read().unwrap().active_async_workers != 0 {
+            assert!(std::time::Instant::now() < deadline);
+            thread::yield_now();
+        }
+    }
+
+    #[test]
     fn test_with_max_threads_async_performance() {
         // Test that with_max_threads affects async performance
         let prop = ObservableProperty::with_max_threads(0, 1); // Single thread
@@ -9230,6 +9375,22 @@ mod tests {
     }
 
     #[test]
+    fn test_modify_panic_restores_value_and_lock() {
+        let prop = ObservableProperty::new(7);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = prop.modify(|value| {
+                *value = 99;
+                panic!("expected test panic");
+            });
+        }));
+
+        assert!(result.is_err());
+        assert_eq!(prop.get().unwrap(), 7);
+        prop.set(8).unwrap();
+        assert_eq!(prop.get().unwrap(), 8);
+    }
+
+    #[test]
     fn test_modify_with_validator() {
         let prop = ObservableProperty::with_validator(10, |val| {
             if *val >= 0 && *val <= 100 {
@@ -9326,6 +9487,18 @@ mod tests {
         assert_eq!(metrics.total_changes, 3);
         assert_eq!(metrics.observer_calls, 3);
         assert!(metrics.avg_notification_time.as_millis() >= 4);
+    }
+
+    #[test]
+    fn test_notification_metrics_use_constant_space() {
+        let prop = ObservableProperty::new(0);
+        for value in 1..=1_000 {
+            prop.set(value).unwrap();
+        }
+
+        let inner = prop.inner.read().unwrap();
+        assert_eq!(inner.notification_count, 1_000);
+        assert!(inner.notification_time_nanos > 0);
     }
 
     #[test]

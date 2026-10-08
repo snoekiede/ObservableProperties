@@ -1,10 +1,10 @@
 //! Constants used throughout the observable property library
 
-/// Maximum number of background threads used for asynchronous observer notifications
+/// Default maximum number of background notification workers per property
 ///
-/// This constant controls the degree of parallelism when using `set_async()` to notify
-/// observers. The observer list is divided into batches, with each batch running in
-/// its own background thread, up to this maximum number of threads.
+/// This constant sets the default background worker limit for `set_async()`. The limit
+/// is shared across concurrent calls and clones of a property. When all worker slots
+/// are occupied, new notifications run on the calling thread.
 ///
 /// # Rationale
 ///
@@ -18,7 +18,7 @@
 /// When `set_async()` is called:
 /// 1. All observers are collected into a snapshot
 /// 2. Observers are divided into `MAX_THREADS` batches (or fewer if there are fewer observers)
-/// 3. Each batch executes in its own `thread::spawn()` call
+/// 3. Each batch executes in its own background worker, up to the per-property limit
 /// 4. Observers within each batch are executed sequentially
 ///
 /// For example, with 100 observers and `MAX_THREADS = 4`:
@@ -37,8 +37,8 @@
 ///
 /// # Thread Safety
 ///
-/// This constant is used only during the batching calculation and does not affect
-/// the thread safety of the overall system.
+/// This constant bounds background worker concurrency; it does not affect the
+/// thread safety of the overall system.
 pub const MAX_THREADS: usize = 4;
 
 /// Maximum number of observers allowed per property instance
