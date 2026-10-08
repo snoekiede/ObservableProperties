@@ -22,3 +22,12 @@ jobs:
       run: cargo test --verbose
     - name: Run tests with all features
       run: cargo test --all-features --verbose
+
+  msrv:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@1.88
+    - name: Check minimum supported Rust version
+      run: cargo check --locked --all-targets --all-features
