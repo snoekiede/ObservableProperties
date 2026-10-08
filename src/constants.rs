@@ -2,9 +2,9 @@
 
 /// Default maximum number of background notification workers per property
 ///
-/// This constant sets the default background worker limit for `set_async()`. The limit
-/// is shared across concurrent calls and clones of a property. When all worker slots
-/// are occupied, new notifications run on the calling thread.
+/// This constant sets the default background worker limit for `set_async()`, debounced
+/// observers, and throttled observers. The limit is shared across concurrent calls and
+/// clones of a property. When all worker slots are occupied, notifications run inline.
 ///
 /// # Rationale
 ///
@@ -15,7 +15,7 @@
 ///
 /// # Implementation Details
 ///
-/// When `set_async()` is called:
+/// For `set_async()` notifications:
 /// 1. All observers are collected into a snapshot
 /// 2. Observers are divided into `MAX_THREADS` batches (or fewer if there are fewer observers)
 /// 3. Each batch executes in its own background worker, up to the per-property limit

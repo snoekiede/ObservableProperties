@@ -2,6 +2,7 @@
 name = "observable-property"
 version = "0.4.4"
 edition = "2024"
+rust_version = "1.88"
 authors = ["Iede Snoek <info@esoxsolutions.nl>"]
 license = "MIT OR Apache-2.0"
 description = "A thread-safe observable property implementation for Rust"

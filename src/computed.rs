@@ -1,6 +1,6 @@
 //! Computed properties that automatically update based on dependencies
 
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use crate::{ObservableProperty, PropertyError};
 
 /// Creates a computed property that automatically updates when dependencies change
@@ -120,28 +120,38 @@ where
     // Wrap compute_fn in Arc for sharing across multiple subscriptions
     let compute_fn = Arc::new(compute_fn);
     
-    // Subscribe to each dependency
+    let weak_dependencies: Vec<Weak<ObservableProperty<T>>> =
+        dependencies.iter().map(Arc::downgrade).collect();
+
+    // The computed property owns dependencies and subscription guards. Callbacks
+    // hold weak references so the dependency graph cannot retain the output.
     for dependency in dependencies.iter() {
-        let deps_clone = dependencies.clone();
-        let computed_clone = computed_property.clone();
+        let weak_dependencies = weak_dependencies.clone();
+        let computed_weak = Arc::downgrade(&computed_property);
         let compute_fn_clone = compute_fn.clone();
         
-        // Subscribe to this dependency
-        dependency.subscribe(Arc::new(move |_old, _new| {
-            // When any dependency changes, collect all current values
-            let current_values: Result<Vec<T>, PropertyError> = 
-                deps_clone.iter().map(|dep| dep.get()).collect();
-            
-            if let Ok(values) = current_values {
-                // Recompute the value
+        dependency.subscribe_owned(&computed_property, Arc::new(move |_old, _new| {
+            let Some(dependencies) = weak_dependencies
+                .iter()
+                .map(Weak::upgrade)
+                .collect::<Option<Vec<_>>>()
+            else {
+                return;
+            };
+
+            let current_values: Result<Vec<T>, PropertyError> =
+                dependencies.iter().map(|dependency| dependency.get()).collect();
+
+            if let (Ok(values), Some(computed_property)) = (current_values, computed_weak.upgrade()) {
                 let new_computed = compute_fn_clone(&values);
-                
-                // Update the computed property
-                if let Err(e) = computed_clone.set(new_computed) {
+
+                if let Err(e) = computed_property.set(new_computed) {
                     eprintln!("Error updating computed property: {}", e);
                 }
             }
         }))?;
+
+        computed_property.retain_resource(dependency.clone());
     }
     
     Ok(computed_property)

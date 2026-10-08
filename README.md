@@ -10,12 +10,12 @@
 * **Debouncing**: Delay notifications until changes stop for a specified duration
 * **Throttling**: Rate-limit notifications to at most once per time interval
 * **Async notifications**: Bounded background workers with caller-thread fallback under load
-* **Configurable threading**: Set the per-property background worker limit via `with_max_threads()`
+* **Configurable threading**: Set the per-property worker limit for async, debounced, and throttled notifications
 * **Panic isolation**: Observer panics don't crash the system
 * **Robust error handling**: Comprehensive error handling with descriptive error messages
 * **Type-safe**: Generic implementation works with any `Clone + Send + Sync + 'static' type
 * **No mandatory runtime dependencies**: Optional serde and debug features add their own dependencies
-* **Tested with all features**: 246 unit and documentation tests
+* **Tested with all features**: 260 unit and documentation tests
 
 A thread-safe observable property implementation for Rust that allows you to observe changes to values across multiple threads.
 
@@ -27,7 +27,7 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-observable-property = "0.4.3"
+observable-property = "0.4.4"
 ```
 
 ## Usage
@@ -330,7 +330,7 @@ fn main() -> Result<(), observable_property::PropertyError> {
 
 ### Async Notifications
 
-`set_async()` normally runs observers on background workers. The worker limit is shared across concurrent calls and clones of one property. When all slots are occupied, or the operating system cannot start a worker, that call runs its observers on the calling thread instead. This preserves notifications while bounding library-created background workers; it means `set_async()` can block under load.
+`set_async()`, debounced observers, and throttled observers share a per-property background worker limit across concurrent calls and clones. When all slots are occupied, or the operating system cannot start a worker, notifications run on the calling thread instead. This preserves notifications while bounding library-created background workers, but callbacks may block a setter under load.
 
 ```rust
 use observable_property::ObservableProperty;
@@ -364,7 +364,7 @@ fn main() -> Result<(), observable_property::PropertyError> {
 
 ### Configurable Threading
 
-Set the maximum number of concurrent background notification workers per property:
+Set the maximum number of concurrent background workers used by async, debounced, and throttled notifications:
 
 ```rust
 use observable_property::ObservableProperty;
@@ -391,6 +391,17 @@ fn main() -> Result<(), observable_property::PropertyError> {
     Ok(())
 }
 ```
+
+### Async Feature
+
+The `async` feature enables `wait_for()` and `to_stream()`:
+
+```toml
+[dependencies]
+observable-property = { version = "0.4.4", features = ["async"] }
+```
+
+`wait_for()` returns a future that resolves with the first value matching its predicate. `to_stream()` yields the current value followed by updates. The crate's `Stream` trait is standard-library based and is not compatible with `futures-core::Stream`.
 
 ## Error Handling
 
@@ -576,10 +587,14 @@ let _subscription = property.subscribe_with_subscription(Arc::new(|old, new| {
 
 ## Recent Improvements
 
-### v0.4.3 - Bounded Async Dispatch and Panic Safety
+### v0.4.4 - Concurrency and State Consistency
 
-- **Bounded async workers**: `set_async()` shares a per-property worker limit across clones and concurrent calls; saturated dispatch falls back inline.
+- **Bounded notification workers**: Async, debounced, and throttled notifications share a per-property worker cap; saturated dispatch falls back inline.
+- **Woken async consumers**: Streams and `wait_for()` register and invoke wakers, and clean up subscriptions when complete.
+- **Subscription lifetimes**: Mapped, computed, and bidirectionally bound properties release source observers when dropped.
 - **Constant-space metrics**: Notification timing averages no longer retain a sample for every update.
+- **Consistent state tracking**: Batch updates validate before committing, roll back on panic, and record intermediate history/events; empty update batches do not notify.
+- **Ordered persistence**: Concurrent save callbacks serialize and persist the latest committed value.
 - **Panic-safe modification**: `modify()` restores the previous value before resuming a panic from user code.
 - **All-features CI**: Optional serde documentation examples are exercised by the test workflow.
 
@@ -624,10 +639,10 @@ Async callbacks can execute inline when background capacity is saturated, and ca
 
 ## Testing
 
-Run the full feature matrix with `cargo test --all-features`. The current suite contains 246 tests:
+Run the full feature matrix with `cargo test --all-features`. The current suite contains 260 tests:
 
 ### Test Statistics
-- **132 unit tests**
+- **146 unit tests**
 - **114 documentation tests**
 - **100% passing** - All tests consistently pass
 

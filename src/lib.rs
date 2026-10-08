@@ -261,7 +261,7 @@ use crate::events::ChangeLog;
 use std::collections::HashMap;
 use std::mem;
 use std::panic;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, RwLock, Weak};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -347,7 +347,10 @@ where
     inner: Arc<RwLock<InnerProperty<T>>>,
     max_threads: usize,
     max_observers: usize,
+    owned_resources: OwnedResources,
 }
+
+type OwnedResources = Arc<Mutex<Vec<Box<dyn Send + Sync>>>>;
 
 struct AsyncWorkerGuard<T: Clone + Send + Sync + 'static> {
     inner: Arc<RwLock<InnerProperty<T>>>,
@@ -363,7 +366,168 @@ impl<T: Clone + Send + Sync + 'static> Drop for AsyncWorkerGuard<T> {
     }
 }
 
+struct BindingSubscriptions<T: Clone + Send + Sync + 'static> {
+    subscriptions: Mutex<Option<(Subscription<T>, Subscription<T>)>>,
+}
+
+impl<T: Clone + Send + Sync + 'static> BindingSubscriptions<T> {
+    fn cancel(&self) {
+        let subscriptions = match self.subscriptions.lock() {
+            Ok(mut guard) => guard.take(),
+            Err(poisoned) => poisoned.into_inner().take(),
+        };
+        drop(subscriptions);
+    }
+}
+
+struct BindingLease<T: Clone + Send + Sync + 'static> {
+    subscriptions: Arc<BindingSubscriptions<T>>,
+}
+
+impl<T: Clone + Send + Sync + 'static> Drop for BindingLease<T> {
+    fn drop(&mut self) {
+        self.subscriptions.cancel();
+    }
+}
+
+#[derive(Clone, Copy)]
+enum TimerKind {
+    Debounce(Duration),
+    Throttle(Duration),
+}
+
+struct ScheduledObserverState<T> {
+    pending: Option<(T, T)>,
+    last_change: Instant,
+    last_notification: Option<Instant>,
+    worker_active: bool,
+}
+
+fn recover_mutex<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn wait_recover<'a, T>(
+    condition: &Condvar,
+    guard: MutexGuard<'a, T>,
+    timeout: Duration,
+) -> MutexGuard<'a, T> {
+    condition
+        .wait_timeout(guard, timeout)
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .0
+}
+
+fn reserve_async_worker<T: Clone + Send + Sync + 'static>(
+    inner: &Weak<RwLock<InnerProperty<T>>>,
+    max_threads: usize,
+) -> Option<AsyncWorkerGuard<T>> {
+    let inner = inner.upgrade()?;
+    let mut prop = match inner.write() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if prop.active_async_workers >= max_threads {
+        return None;
+    }
+    prop.active_async_workers += 1;
+    drop(prop);
+    Some(AsyncWorkerGuard { inner })
+}
+
+fn notify_scheduled_observer<T: Clone>(observer: &Observer<T>, values: Option<(T, T)>) {
+    if let Some((old_value, new_value)) = values
+        && let Err(error) = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+            observer(&old_value, &new_value);
+        }))
+    {
+        eprintln!("Scheduled observer panic: {:?}", error);
+    }
+}
+
+fn dispatch_scheduled_inline<T: Clone>(
+    state: &Arc<(Mutex<ScheduledObserverState<T>>, Condvar)>,
+    observer: &Observer<T>,
+    kind: TimerKind,
+) {
+    let values = {
+        let (state_mutex, _) = &**state;
+        let mut state = recover_mutex(state_mutex);
+        state.worker_active = false;
+        if matches!(kind, TimerKind::Throttle(_)) {
+            state.last_notification = Some(Instant::now());
+        }
+        state.pending.take()
+    };
+    notify_scheduled_observer(observer, values);
+}
+
+fn start_scheduled_worker<T: Clone + Send + Sync + 'static>(
+    state: Arc<(Mutex<ScheduledObserverState<T>>, Condvar)>,
+    inner: Weak<RwLock<InnerProperty<T>>>,
+    max_threads: usize,
+    observer: Observer<T>,
+    kind: TimerKind,
+) {
+    let Some(worker_guard) = reserve_async_worker(&inner, max_threads) else {
+        dispatch_scheduled_inline(&state, &observer, kind);
+        return;
+    };
+
+    let fallback_state = state.clone();
+    let fallback_observer = observer.clone();
+    let spawn_result = thread::Builder::new().spawn(move || {
+        let _worker_guard = worker_guard;
+        let (state_mutex, condition) = &*state;
+        let mut state = recover_mutex(state_mutex);
+
+        loop {
+            let remaining = match kind {
+                TimerKind::Debounce(duration) => duration.saturating_sub(state.last_change.elapsed()),
+                TimerKind::Throttle(interval) => state
+                    .last_notification
+                    .map(|last| interval.saturating_sub(last.elapsed()))
+                    .unwrap_or_default(),
+            };
+
+            if remaining.is_zero() {
+                let values = state.pending.take();
+                state.worker_active = false;
+                if matches!(kind, TimerKind::Throttle(_)) && values.is_some() {
+                    state.last_notification = Some(Instant::now());
+                }
+                drop(state);
+                notify_scheduled_observer(&observer, values);
+                return;
+            }
+
+            state = wait_recover(condition, state, remaining);
+        }
+    });
+
+    if spawn_result.is_err() {
+        dispatch_scheduled_inline(&fallback_state, &fallback_observer, kind);
+    }
+}
+
 impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
+    pub(crate) fn retain_resource<R: Send + Sync + 'static>(&self, resource: R) {
+        recover_mutex(&self.owned_resources).push(Box::new(resource));
+    }
+
+    pub(crate) fn subscribe_owned<U: Clone + Send + Sync + 'static>(
+        &self,
+        owner: &ObservableProperty<U>,
+        observer: Observer<T>,
+    ) -> Result<(), PropertyError> {
+        let id = self.subscribe(observer)?;
+        owner.retain_resource(Subscription {
+            inner: self.inner.clone(),
+            id,
+        });
+        Ok(())
+    }
+
     /// Creates a new observable property with the given initial value
     ///
     /// # Arguments
@@ -400,6 +564,7 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
                 change_logs: Vec::new(),
                 batch_depth: 0,
                 batch_initial_value: None,
+                batch_changed: false,
                 eq_fn: None,
                 validator: None,
                 event_log: None,
@@ -407,6 +572,7 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
             })),
             max_threads: MAX_THREADS,
             max_observers: MAX_OBSERVERS,
+            owned_resources: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -542,6 +708,7 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
                 change_logs: Vec::new(),
                 batch_depth: 0,
                 batch_initial_value: None,
+                batch_changed: false,
                 eq_fn: Some(Arc::new(eq_fn)),
                 validator: None,
                 event_log: None,
@@ -549,6 +716,7 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
             })),
             max_threads: MAX_THREADS,
             max_observers: MAX_OBSERVERS,
+            owned_resources: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -772,6 +940,7 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
                 change_logs: Vec::new(),
                 batch_depth: 0,
                 batch_initial_value: None,
+                batch_changed: false,
                 eq_fn: None,
                 validator: Some(Arc::new(validator)),
                 event_log: None,
@@ -779,19 +948,20 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
             })),
             max_threads: MAX_THREADS,
             max_observers: MAX_OBSERVERS,
+            owned_resources: Arc::new(Mutex::new(Vec::new())),
         })
     }
 
-    /// Creates a new observable property with a custom maximum thread count for async notifications
+    /// Creates a new observable property with a custom background worker limit
     ///
-    /// This constructor allows you to customize the maximum number of threads used for
-    /// asynchronous observer notifications via `set_async()`. This is useful for tuning
-    /// performance based on your specific use case and system constraints.
+    /// This constructor configures the maximum number of background workers used by
+    /// `set_async()`, `subscribe_debounced()`, and `subscribe_throttled()`. The limit is
+    /// shared across concurrent calls and clones of this property.
     ///
     /// # Arguments
     ///
     /// * `initial_value` - The starting value for this property
-    /// * `max_threads` - Maximum number of threads to use for async notifications.
+    /// * `max_threads` - Maximum number of background notification workers.
     ///   If 0 is provided, defaults to 4.
     ///
     /// # Background Worker Limit
@@ -838,8 +1008,9 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
     ///
     /// # Thread Safety
     ///
-    /// This setting only affects async notifications (`set_async()`). Synchronous
-    /// operations (`set()`) always execute observers sequentially regardless of this setting.
+    /// This setting applies to asynchronous and delayed notification workers. If all worker
+    /// slots are occupied, delayed observers run inline rather than creating another thread.
+    /// Synchronous `set()` observers still run sequentially on the caller's thread.
     ///
     /// # Examples
     ///
@@ -882,6 +1053,7 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
                 change_logs: Vec::new(),
                 batch_depth: 0,
                 batch_initial_value: None,
+                batch_changed: false,
                 eq_fn: None,
                 validator: None,
                 event_log: None,
@@ -889,6 +1061,7 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
             })),
             max_threads,
             max_observers: MAX_OBSERVERS,
+            owned_resources: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -1044,10 +1217,20 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
         // Create the property with the loaded or default value
         let property = Self::new(value);
 
-        // Set up auto-save observer
+        // Serialize saves and read the latest committed value inside the lock.
         let persistence = Arc::new(persistence);
-        if let Err(e) = property.subscribe(Arc::new(move |_old, new| {
-            if let Err(save_err) = persistence.save(new) {
+        let save_lock = Arc::new(Mutex::new(()));
+        let property_inner = Arc::downgrade(&property.inner);
+        if let Err(e) = property.subscribe_owned(&property, Arc::new(move |_old, _new| {
+            let _save_guard = recover_mutex(&save_lock);
+            let Some(inner) = property_inner.upgrade() else {
+                return;
+            };
+            let current_value = match inner.read() {
+                Ok(prop) => prop.value.clone(),
+                Err(poisoned) => poisoned.into_inner().value.clone(),
+            };
+            if let Err(save_err) = persistence.save(&current_value) {
                 eprintln!("Failed to persist property value: {}", save_err);
             }
         })) {
@@ -1206,6 +1389,7 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
                 change_logs: Vec::new(),
                 batch_depth: 0,
                 batch_initial_value: None,
+                batch_changed: false,
                 eq_fn: None,
                 validator: None,
                 event_log: None,
@@ -1213,6 +1397,7 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
             })),
             max_threads: MAX_THREADS,
             max_observers: MAX_OBSERVERS,
+            owned_resources: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -1444,6 +1629,7 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
                 change_logs: Vec::new(),
                 batch_depth: 0,
                 batch_initial_value: None,
+                batch_changed: false,
                 eq_fn: None,
                 validator: None,
                 event_log: Some(Vec::with_capacity(if event_log_size > 0 { event_log_size } else { 16 })),
@@ -1451,6 +1637,7 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
             })),
             max_threads: MAX_THREADS,
             max_observers: MAX_OBSERVERS,
+            owned_resources: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -1591,7 +1778,8 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
     /// This method is thread-safe and can be called concurrently with `set()`,
     /// `get()`, and other operations from multiple threads.
     pub fn undo(&self) -> Result<(), PropertyError> {
-        let (old_value, new_value, observers_snapshot, dead_observer_ids) = {
+        let notification_start = Instant::now();
+        let (old_value, new_value, observers_snapshot, dead_observer_ids, in_batch) = {
             let mut prop = match self.inner.write() {
                 Ok(guard) => guard,
                 Err(poisoned) => poisoned.into_inner(),
@@ -1617,40 +1805,66 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
             // Validate the historical value if a validator is configured
             // This ensures consistency if validation rules have changed since the value was stored
             if let Some(validator) = validator {
-                validator(&previous_value).map_err(|reason| {
-                    // Put the value back in history if validation fails
-                    history.push(previous_value.clone());
-                    PropertyError::ValidationError { 
-                        reason: format!("Cannot undo to invalid historical value: {}", reason)
+                match panic::catch_unwind(panic::AssertUnwindSafe(|| validator(&previous_value))) {
+                    Ok(Ok(())) => {}
+                    Ok(Err(reason)) => {
+                        history.push(previous_value.clone());
+                        return Err(PropertyError::ValidationError {
+                            reason: format!("Cannot undo to invalid historical value: {}", reason),
+                        });
                     }
-                })?;
+                    Err(payload) => {
+                        history.push(previous_value);
+                        drop(prop);
+                        panic::resume_unwind(payload);
+                    }
+                }
             }
             
             let old_value = mem::replace(&mut prop.value, previous_value.clone());
+            prop.record_change(&old_value, &previous_value, false);
+            let in_batch = prop.batch_depth > 0;
+            if in_batch {
+                prop.batch_changed = true;
+            }
 
             // Debug logging (requires T: std::fmt::Debug when debug feature is enabled)
             // Collect active observers (same pattern as set())
             let mut observers_snapshot = Vec::new();
             let mut dead_ids = Vec::new();
-            for (id, observer_ref) in &prop.observers {
-                if let Some(observer) = observer_ref.try_call() {
-                    observers_snapshot.push(observer);
-                } else {
-                    dead_ids.push(*id);
+            if !in_batch {
+                for (id, observer_ref) in &prop.observers {
+                    if let Some(observer) = observer_ref.try_call() {
+                        observers_snapshot.push(observer);
+                    } else {
+                        dead_ids.push(*id);
+                    }
                 }
             }
 
-            (old_value, previous_value, observers_snapshot, dead_ids)
+            (old_value, previous_value, observers_snapshot, dead_ids, in_batch)
         };
 
         // Notify all active observers
-        for observer in observers_snapshot {
-            if let Err(e) = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-                observer(&old_value, &new_value);
-            })) {
-                eprintln!("Observer panic during undo: {:?}", e);
+        if !in_batch {
+            for observer in &observers_snapshot {
+                if let Err(e) = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+                    observer(&old_value, &new_value);
+                })) {
+                    eprintln!("Observer panic during undo: {:?}", e);
+                }
             }
         }
+
+        let notification_time = notification_start.elapsed();
+        let mut prop = match self.inner.write() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if !in_batch {
+            prop.record_notification(observers_snapshot.len(), notification_time);
+        }
+        drop(prop);
 
         // Clean up dead weak observers
         if !dead_observer_ids.is_empty() {
@@ -2188,42 +2402,9 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
 
             // Performance optimization: use mem::replace to avoid one clone operation
             let old_value = mem::replace(&mut prop.value, new_value.clone());
-            
-            // Track the change
-            prop.total_changes += 1;
-            let event_num = prop.total_changes - 1; // Capture for event numbering
-            
-            // Add old value to history if history tracking is enabled
-            let history_size = prop.history_size;
-            if let Some(history) = &mut prop.history {
-                // Add old value to history
-                history.push(old_value.clone());
-                
-                // Enforce history size limit by removing oldest values
-                if history.len() > history_size {
-                    let overflow = history.len() - history_size;
-                    history.drain(0..overflow);
-                }
-            }
-            
-            // Record event if event logging is enabled
-            let event_log_size = prop.event_log_size;
-            if let Some(event_log) = &mut prop.event_log {
-                let event = PropertyEvent {
-                    timestamp: Instant::now(),
-                    old_value: old_value.clone(),
-                    new_value: new_value.clone(),
-                    event_number: event_num, // Use captured event number for consistent numbering
-                    thread_id: format!("{:?}", thread::current().id()),
-                };
-                
-                event_log.push(event);
-                
-                // Enforce event log size limit by removing oldest events (if bounded)
-                if event_log_size > 0 && event_log.len() > event_log_size {
-                    let overflow = event_log.len() - event_log_size;
-                    event_log.drain(0..overflow);
-                }
+            prop.record_change(&old_value, &new_value, true);
+            if in_batch {
+                prop.batch_changed = true;
             }
             
             // Collect active observers and track dead weak observers (only if not in batch)
@@ -2265,11 +2446,7 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
                 Ok(guard) => guard,
                 Err(poisoned) => poisoned.into_inner(),
             };
-            prop.observer_calls += observer_count;
-            prop.notification_time_nanos = prop
-                .notification_time_nanos
-                .saturating_add(notification_time.as_nanos());
-            prop.notification_count = prop.notification_count.saturating_add(1);
+            prop.record_notification(observer_count, notification_time);
         }
 
         // Clean up dead weak observers
@@ -2484,42 +2661,9 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
 
             // Performance optimization: use mem::replace to avoid one clone operation
             let old_value = mem::replace(&mut prop.value, new_value.clone());
-            
-            // Track the change
-            prop.total_changes += 1;
-            let event_num = prop.total_changes - 1; // Capture for event numbering
-            
-            // Add old value to history if history tracking is enabled
-            let history_size = prop.history_size;
-            if let Some(history) = &mut prop.history {
-                // Add old value to history
-                history.push(old_value.clone());
-                
-                // Enforce history size limit by removing oldest values
-                if history.len() > history_size {
-                    let overflow = history.len() - history_size;
-                    history.drain(0..overflow);
-                }
-            }
-            
-            // Record event if event logging is enabled
-            let event_log_size = prop.event_log_size;
-            if let Some(event_log) = &mut prop.event_log {
-                let event = PropertyEvent {
-                    timestamp: Instant::now(),
-                    old_value: old_value.clone(),
-                    new_value: new_value.clone(),
-                    event_number: event_num, // Use captured event number for consistent numbering
-                    thread_id: format!("{:?}", thread::current().id()),
-                };
-                
-                event_log.push(event);
-                
-                // Enforce event log size limit by removing oldest events (if bounded)
-                if event_log_size > 0 && event_log.len() > event_log_size {
-                    let overflow = event_log.len() - event_log_size;
-                    event_log.drain(0..overflow);
-                }
+            prop.record_change(&old_value, &new_value, true);
+            if in_batch {
+                prop.batch_changed = true;
             }
             
             if run_async {
@@ -2535,6 +2679,14 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
         }
 
         if observers_snapshot.is_empty() {
+            let notification_time = notification_start.elapsed();
+            let mut prop = match self.inner.write() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            prop.record_notification(0, notification_time);
+            drop(prop);
+
             // Clean up dead weak observers before returning
             if !dead_observer_ids.is_empty() {
                 let mut prop = match self.inner.write() {
@@ -2603,11 +2755,7 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
                 Ok(guard) => guard,
                 Err(poisoned) => poisoned.into_inner(),
             };
-            prop.observer_calls += observer_count;
-            prop.notification_time_nanos = prop
-                .notification_time_nanos
-                .saturating_add(notification_time.as_nanos());
-            prop.notification_count = prop.notification_count.saturating_add(1);
+            prop.record_notification(observer_count, notification_time);
         }
 
         // Clean up dead weak observers
@@ -2702,6 +2850,7 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
         if prop.batch_depth == 0 {
             // Store the initial value when starting a new batch
             prop.batch_initial_value = Some(prop.value.clone());
+            prop.batch_changed = false;
         }
 
         prop.batch_depth += 1;
@@ -2758,21 +2907,30 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
 
             // Only notify when we've exited all nested batches
             if prop.batch_depth == 0 {
+                let batch_changed = prop.batch_changed;
+                prop.batch_changed = false;
                 if let Some(initial_value) = prop.batch_initial_value.take() {
                     let current_value = prop.value.clone();
                     
-                    // Collect observers if value changed
                     let mut observers_snapshot = Vec::new();
                     let mut dead_ids = Vec::new();
-                    for (id, observer_ref) in &prop.observers {
-                        if let Some(observer) = observer_ref.try_call() {
-                            observers_snapshot.push(observer);
-                        } else {
-                            dead_ids.push(*id);
+                    if batch_changed {
+                        for (id, observer_ref) in &prop.observers {
+                            if let Some(observer) = observer_ref.try_call() {
+                                observers_snapshot.push(observer);
+                            } else {
+                                dead_ids.push(*id);
+                            }
                         }
                     }
                     
-                    (true, initial_value, current_value, observers_snapshot, dead_ids)
+                    (
+                        batch_changed,
+                        initial_value,
+                        current_value,
+                        observers_snapshot,
+                        dead_ids,
+                    )
                 } else {
                     (false, prop.value.clone(), prop.value.clone(), Vec::new(), Vec::new())
                 }
@@ -2781,7 +2939,7 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
             }
         };
 
-        if should_notify && !observers_snapshot.is_empty() {
+        if should_notify {
             // Notify all active observers
             let observer_count = observers_snapshot.len();
             for observer in observers_snapshot {
@@ -2799,11 +2957,7 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
                     Ok(guard) => guard,
                     Err(poisoned) => poisoned.into_inner(),
                 };
-                prop.observer_calls += observer_count;
-                prop.notification_time_nanos = prop
-                    .notification_time_nanos
-                    .saturating_add(notification_time.as_nanos());
-                prop.notification_count = prop.notification_count.saturating_add(1);
+                prop.record_notification(observer_count, notification_time);
             }
 
             // Clean up dead weak observers
@@ -3303,10 +3457,10 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
     ///
     /// # Performance Considerations
     ///
-    /// - Each debounced observer spawns a background thread when changes occur
-    /// - The thread sleeps for the debounce duration and then checks if it should notify
-    /// - Multiple rapid changes don't create multiple threads - they just update the pending value
-    /// - Memory overhead: ~2 Mutex allocations per debounced observer
+    /// - Each debounced observer uses at most one scheduled worker at a time
+    /// - Rapid changes coalesce into the first old value and most recent new value
+    /// - Workers share the property's `max_threads` limit; when saturated, the callback runs inline
+    /// - Memory overhead: one pending transition and synchronization state per observer
     ///
     /// # Thread Safety
     ///
@@ -3317,49 +3471,51 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
         observer: Observer<T>,
         debounce_duration: Duration,
     ) -> Result<ObserverId, PropertyError> {
-        let last_change_time = Arc::new(Mutex::new(Instant::now()));
-        let pending_values = Arc::new(Mutex::new(None::<(T, T)>));
+        let state = Arc::new((
+            Mutex::new(ScheduledObserverState {
+                pending: None,
+                last_change: Instant::now(),
+                last_notification: None,
+                worker_active: false,
+            }),
+            Condvar::new(),
+        ));
+        let inner = Arc::downgrade(&self.inner);
+        let max_threads = self.max_threads;
+        let observer_state = state.clone();
         
-        let debounced_observer = Arc::new(move |old_val: &T, new_val: &T| {
-            // Update the last change time and store the values
-            {
-                let mut last_time = last_change_time.lock().unwrap();
-                *last_time = Instant::now();
-                
-                let mut pending = pending_values.lock().unwrap();
-                *pending = Some((old_val.clone(), new_val.clone()));
-            }
-            
-            // Spawn a thread to wait and then notify if no newer changes occurred
-            let last_change_time_thread = last_change_time.clone();
-            let pending_values_thread = pending_values.clone();
-            let observer_thread = observer.clone();
-            let duration = debounce_duration;
-            
-            thread::spawn(move || {
-                thread::sleep(duration);
-                
-                // Check if enough time has passed since the last change
-                let should_notify = {
-                    let last_time = last_change_time_thread.lock().unwrap();
-                    last_time.elapsed() >= duration
-                };
-                
-                if should_notify {
-                    // Get and clear the pending values
-                    let values = {
-                        let mut pending = pending_values_thread.lock().unwrap();
-                        pending.take()
-                    };
-                    
-                    // Notify the observer with the final values
-                    if let Some((old, new)) = values {
-                        let _ = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-                            observer_thread(&old, &new);
-                        }));
-                    }
+        let debounced_observer = Arc::new(move |old_value: &T, new_value: &T| {
+            let should_start_worker = {
+                let (state_mutex, _) = &*observer_state;
+                let mut state = recover_mutex(state_mutex);
+                let first_old = state
+                    .pending
+                    .take()
+                    .map(|(first_old, _)| first_old)
+                    .unwrap_or_else(|| old_value.clone());
+                state.pending = Some((first_old, new_value.clone()));
+                state.last_change = Instant::now();
+
+                if state.worker_active {
+                    false
+                } else {
+                    state.worker_active = true;
+                    true
                 }
-            });
+            };
+
+            let (_, condition) = &*observer_state;
+            condition.notify_one();
+
+            if should_start_worker {
+                start_scheduled_worker(
+                    observer_state.clone(),
+                    inner.clone(),
+                    max_threads,
+                    observer.clone(),
+                    TimerKind::Debounce(debounce_duration),
+                );
+            }
         });
 
         self.subscribe(debounced_observer)
@@ -3531,9 +3687,10 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
     ///
     /// # Performance Considerations
     ///
-    /// - Throttled observers spawn background threads to handle delayed notifications
+    /// - Each throttled observer uses at most one scheduled worker at a time
+    /// - Workers share the property's `max_threads` limit; when saturated, the callback runs inline
     /// - First notification is immediate (no delay), subsequent ones are rate-limited
-    /// - Memory overhead: ~1 Mutex allocation per throttled observer
+    /// - Memory overhead: one pending transition and synchronization state per observer
     ///
     /// # Thread Safety
     ///
@@ -3544,89 +3701,72 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
         observer: Observer<T>,
         throttle_interval: Duration,
     ) -> Result<ObserverId, PropertyError> {
-        let last_notify_time = Arc::new(Mutex::new(None::<Instant>));
-        let pending_notification = Arc::new(Mutex::new(None::<(T, T)>));
-        
-        let throttled_observer = Arc::new(move |old_val: &T, new_val: &T| {
-            let should_notify_now = {
-                let last_time = last_notify_time.lock().unwrap();
-                match *last_time {
-                    None => true, // First notification - notify immediately
-                    Some(last) => last.elapsed() >= throttle_interval,
+        let state = Arc::new((
+            Mutex::new(ScheduledObserverState {
+                pending: None,
+                last_change: Instant::now(),
+                last_notification: None,
+                worker_active: false,
+            }),
+            Condvar::new(),
+        ));
+        let inner = Arc::downgrade(&self.inner);
+        let max_threads = self.max_threads;
+        let observer_state = state.clone();
+
+        let throttled_observer = Arc::new(move |old_value: &T, new_value: &T| {
+            let now = Instant::now();
+            let (immediate_values, should_start_worker) = {
+                let (state_mutex, _) = &*observer_state;
+                let mut state = recover_mutex(state_mutex);
+                state.last_change = now;
+
+                let due = state
+                    .last_notification
+                    .map(|last| now.duration_since(last) >= throttle_interval)
+                    .unwrap_or(true);
+
+                if due {
+                    let first_old = state
+                        .pending
+                        .take()
+                        .map(|(first_old, _)| first_old)
+                        .unwrap_or_else(|| old_value.clone());
+                    state.last_notification = Some(now);
+                    (Some((first_old, new_value.clone())), false)
+                } else {
+                    let first_old = state
+                        .pending
+                        .take()
+                        .map(|(first_old, _)| first_old)
+                        .unwrap_or_else(|| old_value.clone());
+                    state.pending = Some((first_old, new_value.clone()));
+
+                    if state.worker_active {
+                        (None, false)
+                    } else {
+                        state.worker_active = true;
+                        (None, true)
+                    }
                 }
             };
-            
-            if should_notify_now {
-                // Notify immediately
-                {
-                    let mut last_time = last_notify_time.lock().unwrap();
-                    *last_time = Some(Instant::now());
-                }
-                
-                let _ = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-                    observer(old_val, new_val);
-                }));
+
+            if let Some(values) = immediate_values {
+                notify_scheduled_observer(&observer, Some(values));
+                let (_, condition) = &*observer_state;
+                condition.notify_one();
             } else {
-                // Schedule a notification for later
-                {
-                    let mut pending = pending_notification.lock().unwrap();
-                    *pending = Some((old_val.clone(), new_val.clone()));
+                let (_, condition) = &*observer_state;
+                condition.notify_one();
+                if should_start_worker {
+                    start_scheduled_worker(
+                        observer_state.clone(),
+                        inner.clone(),
+                        max_threads,
+                        observer.clone(),
+                        TimerKind::Throttle(throttle_interval),
+                    );
                 }
-                
-                // Check if we need to spawn a thread for the pending notification
-                let last_notify_time_thread = last_notify_time.clone();
-                let pending_notification_thread = pending_notification.clone();
-                let observer_thread = observer.clone();
-                let interval = throttle_interval;
-                
-                thread::spawn(move || {
-                    // Calculate how long to wait
-                    let wait_duration = {
-                        let last_time = last_notify_time_thread.lock().unwrap();
-                        if let Some(last) = *last_time {
-                            let elapsed = last.elapsed();
-                            if elapsed < interval {
-                                interval - elapsed
-                            } else {
-                                Duration::from_millis(0)
-                            }
-                        } else {
-                            Duration::from_millis(0)
-                        }
-                    };
-                    
-                    if wait_duration > Duration::from_millis(0) {
-                        thread::sleep(wait_duration);
-                    }
-                    
-                    // Check if we should notify
-                    let should_notify = {
-                        let last_time = last_notify_time_thread.lock().unwrap();
-                        match *last_time {
-                            Some(last) => last.elapsed() >= interval,
-                            None => true,
-                        }
-                    };
-                    
-                    if should_notify {
-                        // Get and clear pending notification
-                        let values = {
-                            let mut pending = pending_notification_thread.lock().unwrap();
-                            pending.take()
-                        };
-                        
-                        if let Some((old, new)) = values {
-                            {
-                                let mut last_time = last_notify_time_thread.lock().unwrap();
-                                *last_time = Some(Instant::now());
-                            }
-                            
-                            let _ = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-                                observer_thread(&old, &new);
-                            }));
-                        }
-                    }
-                });
             }
         });
 
@@ -4122,6 +4262,7 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
                 change_logs: Vec::new(),
                 batch_depth: 0,
                 batch_initial_value: None,
+                batch_changed: false,
                 eq_fn: None,
                 validator: None,
                 event_log: None,
@@ -4129,6 +4270,7 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
             })),
             max_threads: if max_threads == 0 { MAX_THREADS } else { max_threads },
             max_observers: if max_observers == 0 { MAX_OBSERVERS } else { max_observers },
+            owned_resources: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -4236,7 +4378,8 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
     where
         F: FnOnce(&mut T),
     {
-        let (old_value, new_value, observers_snapshot, dead_observer_ids) = {
+        let notification_start = Instant::now();
+        let (old_value, new_value, observers_snapshot, dead_observer_ids, in_batch) = {
             let mut prop = match self.inner.write() {
                 Ok(guard) => guard,
                 Err(poisoned) => {
@@ -4290,68 +4433,48 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
 
             // If values are equal, skip everything
             if values_equal {
+                prop.value = old_value;
                 return Ok(());
             }
             
-            // Track the change
-            prop.total_changes += 1;
-            let event_num = prop.total_changes - 1; // Capture for event numbering
-            
-            // Add old value to history if history tracking is enabled
-            let history_size = prop.history_size;
-            if let Some(history) = &mut prop.history {
-                // Add old value to history
-                history.push(old_value.clone());
-                
-                // Enforce history size limit by removing oldest values
-                if history.len() > history_size {
-                    let overflow = history.len() - history_size;
-                    history.drain(0..overflow);
-                }
-            }
-            
-            // Record event if event logging is enabled
-            let event_log_size = prop.event_log_size;
-            if let Some(event_log) = &mut prop.event_log {
-                let event = PropertyEvent {
-                    timestamp: Instant::now(),
-                    old_value: old_value.clone(),
-                    new_value: new_value.clone(),
-                    event_number: event_num, // Use captured event number for consistent numbering
-                    thread_id: format!("{:?}", thread::current().id()),
-                };
-                
-                event_log.push(event);
-                
-                // Enforce event log size limit by removing oldest events (if bounded)
-                if event_log_size > 0 && event_log.len() > event_log_size {
-                    let overflow = event_log.len() - event_log_size;
-                    event_log.drain(0..overflow);
-                }
+            prop.record_change(&old_value, &new_value, true);
+            let in_batch = prop.batch_depth > 0;
+            if in_batch {
+                prop.batch_changed = true;
             }
             
             // Collect active observers and track dead weak observers
             let mut observers = Vec::new();
             let mut dead_ids = Vec::new();
-            for (id, observer_ref) in &prop.observers {
-                if let Some(observer) = observer_ref.try_call() {
-                    observers.push(observer);
-                } else {
-                    // Weak observer is dead, mark for removal
-                    dead_ids.push(*id);
+            if !in_batch {
+                for (id, observer_ref) in &prop.observers {
+                    if let Some(observer) = observer_ref.try_call() {
+                        observers.push(observer);
+                    } else {
+                        dead_ids.push(*id);
+                    }
                 }
             }
             
-            (old_value, new_value, observers, dead_ids)
+            (old_value, new_value, observers, dead_ids, in_batch)
         };
 
         // Notify observers with old and new values
-        for observer in observers_snapshot {
-            if let Err(e) = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-                observer(&old_value, &new_value);
-            })) {
-                eprintln!("Observer panic in modify: {:?}", e);
+        if !in_batch {
+            for observer in &observers_snapshot {
+                if let Err(e) = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+                    observer(&old_value, &new_value);
+                })) {
+                    eprintln!("Observer panic in modify: {:?}", e);
+                }
             }
+
+            let notification_time = notification_start.elapsed();
+            let mut prop = match self.inner.write() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            prop.record_notification(observers_snapshot.len(), notification_time);
         }
 
         // Clean up dead weak observers
@@ -4584,13 +4707,28 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
         // Get initial value and transform it
         let initial_value = self.get()?;
         let derived = ObservableProperty::new(transform(&initial_value));
-        
-        // Subscribe to source changes and update derived property
-        let derived_clone = derived.clone();
+
+        let derived_inner = Arc::downgrade(&derived.inner);
+        let derived_resources = Arc::downgrade(&derived.owned_resources);
+        let max_threads = derived.max_threads;
+        let max_observers = derived.max_observers;
         let transform = Arc::new(transform);
-        self.subscribe(Arc::new(move |_old, new| {
+        self.subscribe_owned(&derived, Arc::new(move |_old, new| {
+            let Some(inner) = derived_inner.upgrade() else {
+                return;
+            };
+            let Some(owned_resources) = derived_resources.upgrade() else {
+                return;
+            };
+
+            let derived = ObservableProperty {
+                inner,
+                max_threads,
+                max_observers,
+                owned_resources,
+            };
             let transformed = transform(new);
-            if let Err(e) = derived_clone.set(transformed) {
+            if let Err(e) = derived.set(transformed) {
                 eprintln!("Failed to update derived property: {}", e);
             }
         }))?;
@@ -4750,53 +4888,70 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
     where
         F: FnOnce(&mut T) -> Vec<T>,
     {
-        let (initial_value, intermediate_states, observers_snapshot, dead_observer_ids) = {
+        let notification_start = Instant::now();
+        let (initial_value, intermediate_states, observers_snapshot, dead_observer_ids, in_batch) = {
             let mut prop = match self.inner.write() {
                 Ok(guard) => guard,
-                Err(poisoned) => {
-                    // Graceful degradation: recover from poisoned write lock
-                    poisoned.into_inner()
-                }
+                Err(poisoned) => poisoned.into_inner(),
             };
 
             let initial_value = prop.value.clone();
-            let states = f(&mut prop.value);
-            
-            // Update to the final state if intermediate states were provided
-            // Otherwise, restore the original value (ignore any in-place modifications)
-            if let Some(final_state) = states.last() {
-                prop.value = final_state.clone();
-                
-                // Add initial value to history if history tracking is enabled
-                // Note: We only track the pre-batch initial value, not intermediates
-                let history_size = prop.history_size;
-                if let Some(history) = &mut prop.history {
-                    history.push(initial_value.clone());
-                    
-                    // Enforce history size limit by removing oldest values
-                    if history.len() > history_size {
-                        let overflow = history.len() - history_size;
-                        history.drain(0..overflow);
+            let mut staged_value = initial_value.clone();
+            let states = match panic::catch_unwind(panic::AssertUnwindSafe(|| f(&mut staged_value))) {
+                Ok(states) => states,
+                Err(payload) => {
+                    drop(prop);
+                    panic::resume_unwind(payload);
+                }
+            };
+
+            let Some(final_state) = states.last() else {
+                return Ok(());
+            };
+
+            if let Some(validator) = prop.validator.as_ref() {
+                match panic::catch_unwind(panic::AssertUnwindSafe(|| validator(final_state))) {
+                    Ok(Ok(())) => {}
+                    Ok(Err(reason)) => return Err(PropertyError::ValidationError { reason }),
+                    Err(payload) => {
+                        drop(prop);
+                        panic::resume_unwind(payload);
                     }
                 }
-            } else {
-                prop.value = initial_value.clone();
+            }
+
+            let in_batch = prop.batch_depth > 0;
+            let mut previous_state = initial_value.clone();
+            for current_state in &states {
+                prop.record_change(&previous_state, current_state, true);
+                previous_state = current_state.clone();
+            }
+            prop.value = final_state.clone();
+            if in_batch {
+                prop.batch_changed = true;
             }
             
             // Collect active observers and track dead weak observers
             let mut observers = Vec::new();
             let mut dead_ids = Vec::new();
-            for (id, observer_ref) in &prop.observers {
-                if let Some(observer) = observer_ref.try_call() {
-                    observers.push(observer);
-                } else {
-                    // Weak observer is dead, mark for removal
-                    dead_ids.push(*id);
+            if !in_batch {
+                for (id, observer_ref) in &prop.observers {
+                    if let Some(observer) = observer_ref.try_call() {
+                        observers.push(observer);
+                    } else {
+                        dead_ids.push(*id);
+                    }
                 }
             }
             
-            (initial_value, states, observers, dead_ids)
+            (initial_value, states, observers, dead_ids, in_batch)
         };
+
+        if in_batch {
+            return Ok(());
+        }
+
+        let transition_count = intermediate_states.len();
 
         // Notify observers for each state transition
         if !intermediate_states.is_empty() {
@@ -4812,6 +4967,18 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
                 }
                 previous_state = current_state;
             }
+        }
+
+        let notification_time = notification_start.elapsed();
+        {
+            let mut prop = match self.inner.write() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            prop.record_notification(
+                observers_snapshot.len().saturating_mul(transition_count),
+                notification_time,
+            );
         }
 
         // Clean up dead weak observers
@@ -5009,107 +5176,69 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
     where
         T: PartialEq,
     {
-        // Subscribe self to other's changes
-        // When other changes, update self
-        let self_inner = Arc::clone(&self.inner);
-        other.subscribe(Arc::new(move |_old, new| {
-            // Check if self's current value differs to prevent infinite loop
-            let should_update = {
-                match self_inner.read() {
-                    Ok(prop) => &prop.value != new,
-                    Err(poisoned) => &poisoned.into_inner().value != new,
-                }
+        let self_inner = Arc::downgrade(&self.inner);
+        let self_resources = Arc::downgrade(&self.owned_resources);
+        let self_max_threads = self.max_threads;
+        let self_max_observers = self.max_observers;
+        let other_to_self = other.subscribe(Arc::new(move |_old, new| {
+            let (Some(inner), Some(owned_resources)) =
+                (self_inner.upgrade(), self_resources.upgrade())
+            else {
+                return;
             };
-
-            if should_update {
-                let mut prop = match self_inner.write() {
-                    Ok(guard) => guard,
-                    Err(poisoned) => poisoned.into_inner(),
-                };
-
-                let old_value = mem::replace(&mut prop.value, new.clone());
-
-                // Add to history if enabled
-                let history_size = prop.history_size;
-                if let Some(history) = &mut prop.history {
-                    history.push(old_value.clone());
-                    if history.len() > history_size {
-                        let overflow = history.len() - history_size;
-                        history.drain(0..overflow);
-                    }
-                }
-
-                // Collect and notify observers
-                let mut observers = Vec::new();
-                for (_id, observer_ref) in &prop.observers {
-                    if let Some(observer) = observer_ref.try_call() {
-                        observers.push(observer);
-                    }
-                }
-                
-                // Release lock before notifying
-                drop(prop);
-
-                for observer in observers {
-                    if let Err(e) = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-                        observer(&old_value, new);
-                    })) {
-                        eprintln!("Observer panic in bidirectional binding: {:?}", e);
-                    }
-                }
+            let target = ObservableProperty {
+                inner,
+                max_threads: self_max_threads,
+                max_observers: self_max_observers,
+                owned_resources,
+            };
+            if target.get().is_ok_and(|value| value != *new)
+                && let Err(error) = target.set(new.clone())
+            {
+                eprintln!("Failed to propagate bidirectional update: {}", error);
             }
         }))?;
+        let other_to_self = Subscription {
+            inner: other.inner.clone(),
+            id: other_to_self,
+        };
 
-        // Subscribe other to self's changes
-        // When self changes, update other
-        let other_inner = Arc::clone(&other.inner);
-        self.subscribe(Arc::new(move |_old, new| {
-            // Check if other's current value differs to prevent infinite loop
-            let should_update = {
-                match other_inner.read() {
-                    Ok(prop) => &prop.value != new,
-                    Err(poisoned) => &poisoned.into_inner().value != new,
-                }
+        let other_inner = Arc::downgrade(&other.inner);
+        let other_resources = Arc::downgrade(&other.owned_resources);
+        let other_max_threads = other.max_threads;
+        let other_max_observers = other.max_observers;
+        let self_to_other = self.subscribe(Arc::new(move |_old, new| {
+            let (Some(inner), Some(owned_resources)) =
+                (other_inner.upgrade(), other_resources.upgrade())
+            else {
+                return;
             };
-
-            if should_update {
-                let mut prop = match other_inner.write() {
-                    Ok(guard) => guard,
-                    Err(poisoned) => poisoned.into_inner(),
-                };
-
-                let old_value = mem::replace(&mut prop.value, new.clone());
-
-                // Add to history if enabled
-                let history_size = prop.history_size;
-                if let Some(history) = &mut prop.history {
-                    history.push(old_value.clone());
-                    if history.len() > history_size {
-                        let overflow = history.len() - history_size;
-                        history.drain(0..overflow);
-                    }
-                }
-
-                // Collect and notify observers
-                let mut observers = Vec::new();
-                for (_id, observer_ref) in &prop.observers {
-                    if let Some(observer) = observer_ref.try_call() {
-                        observers.push(observer);
-                    }
-                }
-                
-                // Release lock before notifying
-                drop(prop);
-
-                for observer in observers {
-                    if let Err(e) = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-                        observer(&old_value, new);
-                    })) {
-                        eprintln!("Observer panic in bidirectional binding: {:?}", e);
-                    }
-                }
+            let target = ObservableProperty {
+                inner,
+                max_threads: other_max_threads,
+                max_observers: other_max_observers,
+                owned_resources,
+            };
+            if target.get().is_ok_and(|value| value != *new)
+                && let Err(error) = target.set(new.clone())
+            {
+                eprintln!("Failed to propagate bidirectional update: {}", error);
             }
         }))?;
+        let self_to_other = Subscription {
+            inner: self.inner.clone(),
+            id: self_to_other,
+        };
+
+        let binding = Arc::new(BindingSubscriptions {
+            subscriptions: Mutex::new(Some((other_to_self, self_to_other))),
+        });
+        self.retain_resource(BindingLease {
+            subscriptions: binding.clone(),
+        });
+        other.retain_resource(BindingLease {
+            subscriptions: binding,
+        });
 
         Ok(())
     }
@@ -5164,29 +5293,41 @@ impl<T: Clone + Send + Sync + 'static> ObservableProperty<T> {
         use std::sync::mpsc;
         
         let (tx, rx) = mpsc::channel::<T>();
-        let inner = self.inner.clone();
+        let waker = Arc::new(Mutex::new(None));
+        let observer_waker = waker.clone();
 
-        // Get the current value to send as the first item
-        let current_value = inner
-            .read()
-            .or_else(|poisoned| Ok::<_, ()>(poisoned.into_inner()))
-            .map(|prop| prop.value.clone())
-            .ok();
-
-        // Subscribe to changes and send them to the channel
+        // Subscribe before taking the initial snapshot to avoid missing a change.
         let subscription_id = self
             .subscribe(Arc::new(move |_old, new| {
                 let _ = tx.send(new.clone());
+                wake_registered_task(&observer_waker);
             }))
             .ok();
+
+        let current_value = match self.inner.read() {
+            Ok(prop) => Some(prop.value.clone()),
+            Err(poisoned) => Some(poisoned.into_inner().value.clone()),
+        };
 
         PropertyStream {
             rx,
             current_value,
             subscription_id,
             property: self.inner.clone(),
-            waker: Arc::new(Mutex::new(None)),
+            waker,
         }
+    }
+}
+
+#[cfg(feature = "async")]
+fn wake_registered_task(waker: &Mutex<Option<std::task::Waker>>) {
+    let registered_waker = match waker.lock() {
+        Ok(mut guard) => guard.take(),
+        Err(poisoned) => poisoned.into_inner().take(),
+    };
+
+    if let Some(registered_waker) = registered_waker {
+        registered_waker.wake();
     }
 }
 
@@ -5226,11 +5367,17 @@ impl<T: Clone + Send + Sync + Unpin + 'static> Stream for PropertyStream<T> {
         match this.rx.try_recv() {
             Ok(value) => Poll::Ready(Some(value)),
             Err(std::sync::mpsc::TryRecvError::Empty) => {
-                // Store the waker so the observer can wake us up
-                if let Ok(mut waker_lock) = this.waker.lock() {
-                    *waker_lock = Some(cx.waker().clone());
+                match this.waker.lock() {
+                    Ok(mut guard) => *guard = Some(cx.waker().clone()),
+                    Err(poisoned) => *poisoned.into_inner() = Some(cx.waker().clone()),
                 }
-                Poll::Pending
+
+                // Recheck after registering so a send racing with registration is not lost.
+                match this.rx.try_recv() {
+                    Ok(value) => Poll::Ready(Some(value)),
+                    Err(std::sync::mpsc::TryRecvError::Empty) => Poll::Pending,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => Poll::Ready(None),
+                }
             }
             Err(std::sync::mpsc::TryRecvError::Disconnected) => Poll::Ready(None),
         }
@@ -5342,6 +5489,7 @@ where
     rx: std::sync::mpsc::Receiver<T>,
     subscription_id: Option<ObserverId>,
     result: Option<T>,
+    waker: Arc<Mutex<Option<std::task::Waker>>>,
     _phantom: std::marker::PhantomData<F>,
 }
 
@@ -5355,44 +5503,51 @@ where
     where
         P: HasInner<T>,
     {
-        // Check current value first
-        if let Ok(current) = property
-            .read()
-            .or_else(|poisoned| Ok::<_, ()>(poisoned.into_inner()))
-            .map(|prop| prop.value.clone())
-        {
-            if predicate(&current) {
-                // Condition already met - create a dummy channel
-                let (tx, rx) = std::sync::mpsc::channel();
-                let _ = tx.send(current.clone());
-                return Self {
-                    property,
-                    rx,
-                    subscription_id: None,
-                    result: Some(current),
-                    _phantom: std::marker::PhantomData,
-                };
-            }
-        }
-
         let predicate = Arc::new(predicate);
         let (tx, rx) = std::sync::mpsc::channel();
+        let waker = Arc::new(Mutex::new(None));
+        let observer_waker = waker.clone();
+        let observer_predicate = predicate.clone();
 
-        // Subscribe to changes
+        // Subscribe before reading the current value so an intervening update is queued.
         let subscription_id = obs_property
             .subscribe_internal(Arc::new(move |_old, new| {
-                if predicate(new) {
+            if observer_predicate(new) {
                     let _ = tx.send(new.clone());
+                    wake_registered_task(&observer_waker);
                 }
             }))
             .ok();
+
+        let result = rx.try_recv().ok().or_else(|| {
+            let current = match property.read() {
+                Ok(prop) => prop.value.clone(),
+                Err(poisoned) => poisoned.into_inner().value.clone(),
+            };
+            if predicate(&current) {
+                Some(current)
+            } else {
+                None
+            }
+        });
 
         Self {
             property,
             rx,
             subscription_id,
-            result: None,
+            result,
+            waker,
             _phantom: std::marker::PhantomData,
+        }
+    }
+
+    fn unregister(&mut self) {
+        if let Some(id) = self.subscription_id.take() {
+            let mut prop = match self.property.write() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            prop.observers.remove(&id);
         }
     }
 }
@@ -5405,34 +5560,49 @@ where
 {
     type Output = T;
 
-    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
         
         // If we already have a result, return it immediately
         if let Some(result) = this.result.take() {
+            this.unregister();
             return Poll::Ready(result);
         }
 
-        // Try to receive without blocking
         match this.rx.try_recv() {
             Ok(value) => {
-                // Clean up subscription
-                if let Some(id) = this.subscription_id.take() {
-                    if let Ok(mut prop) = this.property.write().or_else(|poisoned| Ok::<_, ()>(poisoned.into_inner())) {
-                        prop.observers.remove(&id);
-                    }
-                }
+                this.unregister();
                 Poll::Ready(value)
             }
-            Err(std::sync::mpsc::TryRecvError::Empty) => Poll::Pending,
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                match this.waker.lock() {
+                    Ok(mut guard) => *guard = Some(cx.waker().clone()),
+                    Err(poisoned) => *poisoned.into_inner() = Some(cx.waker().clone()),
+                }
+
+                // Recheck after registration to avoid losing a concurrent notification.
+                match this.rx.try_recv() {
+                    Ok(value) => {
+                        this.unregister();
+                        Poll::Ready(value)
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => Poll::Pending,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        this.unregister();
+                        let value = match this.property.read() {
+                            Ok(prop) => prop.value.clone(),
+                            Err(poisoned) => poisoned.into_inner().value.clone(),
+                        };
+                        Poll::Ready(value)
+                    }
+                }
+            }
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                // Channel disconnected, try to get current value as fallback
-                let value = this
-                    .property
-                    .read()
-                    .or_else(|poisoned| Ok::<_, ()>(poisoned.into_inner()))
-                    .map(|prop| prop.value.clone())
-                    .unwrap();
+                this.unregister();
+                let value = match this.property.read() {
+                    Ok(prop) => prop.value.clone(),
+                    Err(poisoned) => poisoned.into_inner().value.clone(),
+                };
                 Poll::Ready(value)
             }
         }
@@ -5831,6 +6001,7 @@ impl<T: Clone + Send + Sync + 'static> Clone for ObservableProperty<T> {
             inner: Arc::clone(&self.inner),
             max_threads: self.max_threads,
             max_observers: self.max_observers,
+            owned_resources: Arc::clone(&self.owned_resources),
         }
     }
 }
@@ -8021,6 +8192,31 @@ mod tests {
     }
 
     #[test]
+    fn test_debounce_coalesces_burst_with_one_worker() {
+        let prop = ObservableProperty::with_max_threads(0, 1);
+        let notifications = Arc::new(RwLock::new(Vec::new()));
+        let observed = notifications.clone();
+
+        prop.subscribe_debounced(
+            Arc::new(move |old, new| {
+                observed.write().unwrap().push((*old, *new));
+            }),
+            Duration::from_millis(100),
+        )
+        .unwrap();
+
+        for value in 1..=20 {
+            prop.set(value).unwrap();
+        }
+
+        assert!(prop.inner.read().unwrap().active_async_workers <= 1);
+        thread::sleep(Duration::from_millis(150));
+
+        assert_eq!(*notifications.read().unwrap(), vec![(0, 20)]);
+        assert_eq!(prop.inner.read().unwrap().active_async_workers, 0);
+    }
+
+    #[test]
     fn test_debounced_observer_rapid_changes() {
         let prop = ObservableProperty::new(0);
         let notification_count = Arc::new(AtomicUsize::new(0));
@@ -8204,6 +8400,32 @@ mod tests {
         assert_eq!(vals.len(), 2);
         assert_eq!(vals[0], 1);
         assert_eq!(vals[1], 2);
+    }
+
+    #[test]
+    fn test_throttle_coalesces_burst_with_one_worker() {
+        let prop = ObservableProperty::with_max_threads(0, 1);
+        let notifications = Arc::new(RwLock::new(Vec::new()));
+        let observed = notifications.clone();
+
+        prop.subscribe_throttled(
+            Arc::new(move |old, new| {
+                observed.write().unwrap().push((*old, *new));
+            }),
+            Duration::from_millis(200),
+        )
+        .unwrap();
+
+        prop.set(1).unwrap();
+        for value in 2..=20 {
+            prop.set(value).unwrap();
+        }
+
+        assert!(prop.inner.read().unwrap().active_async_workers <= 1);
+        thread::sleep(Duration::from_millis(250));
+
+        assert_eq!(*notifications.read().unwrap(), vec![(0, 1), (1, 20)]);
+        assert_eq!(prop.inner.read().unwrap().active_async_workers, 0);
     }
 
     #[test]
@@ -8462,6 +8684,16 @@ mod tests {
     }
 
     #[test]
+    fn test_computed_releases_dependency_subscriptions() {
+        let dependency = Arc::new(ObservableProperty::new(5));
+        let derived = computed(vec![dependency.clone()], |values| values[0] * 2).unwrap();
+
+        assert_eq!(dependency.observer_count(), 1);
+        drop(derived);
+        assert_eq!(dependency.observer_count(), 0);
+    }
+
+    #[test]
     fn test_computed_with_observer() {
         let width = Arc::new(ObservableProperty::new(10));
         let height = Arc::new(ObservableProperty::new(5));
@@ -8652,6 +8884,59 @@ mod tests {
 
         assert_eq!(notification_count.load(Ordering::SeqCst), 0);
         assert_eq!(prop.get().unwrap(), 42); // Value unchanged
+    }
+
+    #[test]
+    fn test_update_batch_rejects_invalid_final_value() {
+        let prop = ObservableProperty::with_validator(5, |value| {
+            if *value <= 10 {
+                Ok(())
+            } else {
+                Err("value exceeds limit".to_string())
+            }
+        })
+        .unwrap();
+
+        let result = prop.update_batch(|_| vec![15]);
+        assert!(matches!(result, Err(PropertyError::ValidationError { .. })));
+        assert_eq!(prop.get().unwrap(), 5);
+        assert_eq!(prop.get_metrics().unwrap().total_changes, 0);
+    }
+
+    #[test]
+    fn test_update_batch_panic_leaves_value_unchanged() {
+        let prop = ObservableProperty::new(5);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = prop.update_batch(|staged| {
+                *staged = 99;
+                panic!("expected test panic");
+            });
+        }));
+
+        assert!(result.is_err());
+        assert_eq!(prop.get().unwrap(), 5);
+        prop.set(6).unwrap();
+        assert_eq!(prop.get().unwrap(), 6);
+    }
+
+    #[test]
+    fn test_update_batch_records_each_transition() {
+        let prop = ObservableProperty::with_event_log(0, 10);
+        prop.update_batch(|_| vec![1, 2, 3]).unwrap();
+
+        let events = prop.get_event_log();
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0].old_value, 0);
+        assert_eq!(events[0].new_value, 1);
+        assert_eq!(events[1].old_value, 1);
+        assert_eq!(events[1].new_value, 2);
+        assert_eq!(events[2].old_value, 2);
+        assert_eq!(events[2].new_value, 3);
+        assert_eq!(prop.get_metrics().unwrap().total_changes, 3);
+
+        let history = ObservableProperty::with_history(0, 10);
+        history.update_batch(|_| vec![1, 2, 3]).unwrap();
+        assert_eq!(history.get_history(), vec![0, 1, 2]);
     }
 
     #[test]
@@ -8857,6 +9142,23 @@ mod tests {
         assert_eq!(notification_count.load(Ordering::SeqCst), 1);
         assert_eq!(*last_old.read().unwrap(), 0);
         assert_eq!(*last_new.read().unwrap(), 30);
+    }
+
+    #[test]
+    fn test_empty_change_coalescing_batch_does_not_notify() {
+        let prop = ObservableProperty::new(5);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed_calls = calls.clone();
+        prop.subscribe(Arc::new(move |_, _| {
+            observed_calls.fetch_add(1, Ordering::SeqCst);
+        }))
+        .unwrap();
+
+        prop.begin_update().unwrap();
+        prop.end_update().unwrap();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(prop.get().unwrap(), 5);
     }
 
     #[test]
@@ -9308,6 +9610,16 @@ mod tests {
     }
 
     #[test]
+    fn test_map_releases_source_subscription() {
+        let source = ObservableProperty::new(1);
+        let derived = source.map(|value| value * 2).unwrap();
+
+        assert_eq!(source.observer_count(), 1);
+        drop(derived);
+        assert_eq!(source.observer_count(), 0);
+    }
+
+    #[test]
     fn test_map_string_formatting() {
         let count = ObservableProperty::new(42);
         let message = count.map(|n| format!("Count: {}", n)).unwrap();
@@ -9450,6 +9762,18 @@ mod tests {
     }
 
     #[test]
+    fn test_binding_releases_both_subscriptions_when_endpoint_drops() {
+        let first = Arc::new(ObservableProperty::new(1));
+        let second = Arc::new(ObservableProperty::new(1));
+        first.bind_bidirectional(&second).unwrap();
+
+        assert_eq!(first.observer_count(), 1);
+        assert_eq!(second.observer_count(), 1);
+        drop(first);
+        assert_eq!(second.observer_count(), 0);
+    }
+
+    #[test]
     fn test_bind_bidirectional_strings() {
         let prop1 = Arc::new(ObservableProperty::new("first".to_string()));
         let prop2 = Arc::new(ObservableProperty::new("first".to_string())); // Start with same value
@@ -9487,6 +9811,20 @@ mod tests {
         assert_eq!(metrics.total_changes, 3);
         assert_eq!(metrics.observer_calls, 3);
         assert!(metrics.avg_notification_time.as_millis() >= 4);
+    }
+
+    #[test]
+    fn test_metrics_include_modify_and_undo_notifications() {
+        let prop = ObservableProperty::with_history(0, 5);
+        prop.subscribe(Arc::new(|_, _| {})).unwrap();
+
+        prop.set(1).unwrap();
+        prop.modify(|value| *value = 2).unwrap();
+        prop.undo().unwrap();
+
+        let metrics = prop.get_metrics().unwrap();
+        assert_eq!(metrics.total_changes, 3);
+        assert_eq!(metrics.observer_calls, 3);
     }
 
     #[test]
@@ -9552,41 +9890,72 @@ mod tests {
     // Async Features Tests
     // ========================================================================
 
-    // Note: The following async tests are disabled because the wait_for() implementation
-    // needs to be refactored to use an async-compatible channel (tokio::sync::mpsc)
-    // instead of std::sync::mpsc to properly integrate with async runtimes.
-    // The current implementation returns Poll::Pending without registering a waker,
-    // causing the tests to hang indefinitely.
-    // TODO: Fix in version 0.5.0 by adding tokio as optional dependency for async feature
-
-    /*
     #[cfg(feature = "async")]
     #[tokio::test]
-    async fn test_wait_for_basic() {
+    async fn test_async_wait_for_wakes_after_change() {
         let prop = Arc::new(ObservableProperty::new(0));
         let prop_clone = prop.clone();
 
-        // Spawn task to change value after delay
         tokio::spawn(async move {
-            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
             prop_clone.set(42).unwrap();
         });
 
-        // Wait for value to become 42
-        prop.wait_for(|v| *v == 42).await;
+        let result = tokio::time::timeout(
+            tokio::time::Duration::from_secs(1),
+            prop.wait_for(|value| *value == 42),
+        )
+        .await
+        .expect("wait_for did not wake after the property changed");
+
+        assert_eq!(result, 42);
         assert_eq!(prop.get().unwrap(), 42);
+        assert_eq!(prop.observer_count(), 0);
     }
 
     #[cfg(feature = "async")]
     #[tokio::test]
-    async fn test_wait_for_already_true() {
+    async fn test_async_wait_for_already_true_cleans_subscription() {
         let prop = ObservableProperty::new(100);
 
-        // Predicate is already true
-        prop.wait_for(|v| *v >= 50).await;
+        let result = prop.wait_for(|value| *value >= 50).await;
+
+        assert_eq!(result, 100);
         assert_eq!(prop.get().unwrap(), 100);
+        assert_eq!(prop.observer_count(), 0);
     }
-    */
+
+    #[cfg(feature = "async")]
+    #[tokio::test]
+    async fn test_async_stream_wakes_after_change() {
+        let prop = ObservableProperty::new(1);
+        let mut stream = Box::pin(prop.to_stream());
+
+        let initial = tokio::time::timeout(
+            tokio::time::Duration::from_secs(1),
+            std::future::poll_fn(|cx| stream.as_mut().poll_next(cx)),
+        )
+        .await
+        .expect("stream did not yield its initial value");
+        assert_eq!(initial, Some(1));
+
+        let property_clone = prop.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+            property_clone.set(2).unwrap();
+        });
+
+        let updated = tokio::time::timeout(
+            tokio::time::Duration::from_secs(1),
+            std::future::poll_fn(|cx| stream.as_mut().poll_next(cx)),
+        )
+        .await
+        .expect("stream did not wake after the property changed");
+        assert_eq!(updated, Some(2));
+
+        drop(stream);
+        assert_eq!(prop.observer_count(), 0);
+    }
 
     // ========================================================================
     // Observer Count Tests
@@ -9720,6 +10089,29 @@ mod tests {
         prop.set(30).unwrap();
         thread::sleep(Duration::from_millis(10));
         assert_eq!(*storage.read().unwrap(), Some(30));
+    }
+
+    #[test]
+    fn test_with_persistence_concurrent_updates_save_latest_value() {
+        let storage = Arc::new(RwLock::new(None));
+        let property = Arc::new(ObservableProperty::with_persistence(
+            0,
+            MockPersistence {
+                data: storage.clone(),
+            },
+        ));
+
+        let handles: Vec<_> = (1..=32)
+            .map(|value| {
+                let property = property.clone();
+                thread::spawn(move || property.set(value).unwrap())
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        assert_eq!(*storage.read().unwrap(), Some(property.get().unwrap()));
     }
 
     #[test]
